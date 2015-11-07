@@ -8,8 +8,9 @@ srun <script name>
 
 Requirements
 ------------
-mpi4py version 1.3.1 or more recent
-(implies version 0.2.2. or more recent of ctypes)
+- mpi4py version 1.3.1 or more recent
+ (implies version 0.2.2. or more recent of ctypes)
+- custom version of lammps.py
 
 Synopsis
 --------
@@ -53,6 +54,7 @@ Fri Nov  6 15:22:24 CET 2015
 
 from mpi4py import MPI
 import numpy as np
+from numpy import ma as ma
 from lammps import lammps
 from string import Template
 
@@ -66,6 +68,7 @@ def main():
     TOL = 1.0e-4            # Stop criterion (max. string displacement)
     num_atoms = 311040      # Number of atoms
     num_dof = num_atoms * 3 # Degrees of freedom
+    fixed_types = [3, 4]
     periodic_x = 0
     periodic_y = 0
     periodic_z = 1
@@ -146,11 +149,6 @@ def main():
     # Displacements for MPI scattering
     dof_chunk_displ = [c[0] for c in dof_chunk_bounds]
     dof_chunk_sizes = [len(range(c[0], c[1])) for c in dof_chunk_bounds]
-    chunk_of_this_replica_dof = np.empty(dof_chunk_sizes[group.rank])
-    chunk_of_this_replica_force = np.empty(dof_chunk_sizes[group.rank])
-    if color > 0:
-        chunk_of_left_replica_dof = np.empty(dof_chunk_sizes[group.rank])
-        chunk_of_right_replica_dof = np.empty(dof_chunk_sizes[group.rank])
     # Chunk for image flags:
     ideal_img_chunk_size = ideal_dof_chunk_size / 3
     img_chunk_bounds = [
@@ -162,7 +160,7 @@ def main():
     img_chunk_sizes = [len(range(c[0], c[1])) for c in img_chunk_bounds]
     img_chunk = np.empty(img_chunk_sizes[group.rank], dtype=np.int32)
 
-    # Extract simulation box size
+    # Calculate size of the box
     box_size = np.zeros(3)
     box_size[0] += this_lammps.extract_global("boxxhi", 1)
     box_size[0] -= this_lammps.extract_global("boxxlo", 1)
@@ -170,6 +168,33 @@ def main():
     box_size[1] -= this_lammps.extract_global("boxylo", 1)
     box_size[2] += this_lammps.extract_global("boxzhi", 1)
     box_size[2] -= this_lammps.extract_global("boxzlo", 1)
+
+    # Declare chunks as masked
+    # Note: masks are preserved in Scatterv / Gatherv operations.
+    # They are not set by these operations.
+    this_replica_atom_types = np.asarray(
+        this_lammps.gather_atoms("type", 0, 1)
+    )
+    this_replica_atom_types = np.vstack([this_replica_atom_types] * 3)
+    this_replica_atom_types = this_replica_atom_types.reshape((-1,),order='F')
+    dof_mask = [this_replica_atom_types == i for i in fixed_types]
+    dof_mask = np.logical_or.reduce(dof_mask)
+    fixed_dofs = np.where[dof_mask][0]
+    chunk_of_this_replica_dof = ma.empty(dof_chunk_sizes[group.rank])
+    chunk_of_this_replica_dof.mask = dof_mask
+    chunk_of_this_replica_dof_old = ma.empty(dof_chunk_sizes[group.rank])
+    chunk_of_this_replica_dof_old.mask = dof_mask
+    if color > 0:
+        chunk_of_left_replica_dof = ma.empty(dof_chunk_sizes[group.rank])
+        chunk_of_left_replica_dof = dof_mask
+        chunk_of_right_replica_dof = ma.empty(dof_chunk_sizes[group.rank])
+        chunk_of_right_replica_dof = dof_mask
+    chunk_of_tangent = ma.empty(dof_chunk_sizes[group.rank])
+    chunk_of_tangent = dof_mask
+    chunk_of_this_replica_force = ma.empty(dof_chunk_sizes[group.rank])
+    chunk_of_this_replica_force = dof_mask
+    chunk_of_perp_force = ma.empty(dof_chunk_sizes[group.rank])
+    chunk_of_perp_force = dof_mask
 
     # Initialize old coordinates and unwrap
     this_replica_dof_old = np.asarray(
@@ -197,14 +222,6 @@ def main():
         [this_replica_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
         root=0
     )
-    this_replica_atom_types = np.asarray(
-        this_lammps.gather_atoms("type", 0, 1)
-    )
-    # Todo: mask arrays
-    this_replica_atom_types = np.vstack([this_replica_atom_types] * 3)
-    this_replica_atom_types = this_replica_atom_types.reshape((-1,),order='F')
-    fixed_atoms = np.where(np.logical_or(
-                this_replica_atom_types == 3, this_replica_atom_types == 4))[0]
 
     # Rank 0 stores the convergence history
     if world.rank == 0:
@@ -223,6 +240,7 @@ def main():
         # Extract coordinates and energy
         # Note: - all processes in the group have the same view
         #       - np.asarray from ctypes does not copy, ideally
+        #       - these arrays are not masked
         this_replica_dof = np.asarray(
             this_lammps.gather_atoms("x", 1, 3)
         )
@@ -235,7 +253,13 @@ def main():
         this_replica_energy = np.asarray(
             this_lammps.extract_variable("PE", "all", 0)
         )
-        # Apply image flags
+        all_energies = np.empty(world.size)
+        world.Allgather(
+                [this_replica_energy, MPI.DOUBLE],
+                [all_energies, MPI.DOUBLE]
+        )
+        all_energies = all_energies[group_roots]
+        # Unwrap atom positions
         group.Scatterv(
             [this_replica_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
             chunk_of_this_replica_dof, root=0
@@ -323,7 +347,10 @@ def main():
             group.Scatterv(
                 [this_replica_force, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
                 chunk_of_this_replica_force, root=0)
-            sendbuf = np.vdot(chunk_of_this_replica_force, chunk_of_tangent)
+            sendbuf = ma.dot(
+                    ma.ravel(chunk_of_this_replica_force),
+                    ma.ravel(chunk_of_tangent)
+            )
             projection = np.empty(1)
             group.Allreduce([sendbuf, MPI.DOUBLE],
                 [projection, MPI.DOUBLE], op=MPI.SUM)
@@ -417,12 +444,14 @@ def main():
             re = MPI.Request.Waitall(requests)
             #print('#Color {:d} waitall returns:', re)
 
-        # Reset type 2 atoms
-        this_replica_dof[fixed_atoms] = this_replica_dof_old[fixed_atoms]
+        # Reset coordinates  of atoms with  fixed dofs. This is  necessary even
+        # though masked chunks have been used throughout because Gatherv copies
+        # values  (it  ignores  masks).  So  this_replica_dof[fixed_dofs]  will
+        # contain whatever was in the corresponding chunks at these positions.
+        this_replica_dof[fixed_dofs] = this_replica_dof_old[fixed_dofs]
         group.Scatterv(
             [this_replica_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
             chunk_of_this_replica_dof, root=0)
-        chunk_of_this_replica_dof_old = np.empty(dof_chunk_sizes[group.rank])
         group.Scatterv(
             [this_replica_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
             chunk_of_this_replica_dof_old, root=0)
@@ -432,8 +461,13 @@ def main():
                 chunk_of_this_replica_dof,
                 chunk_of_this_replica_dof_old
         )
+        # Find maximum displacement
+        all_displ = np.empty(world.size)
+        world.Allgather([my_displ, MPI.DOUBLE], [all_displ, MPI.DOUBLE])
+        all_displ = all_displ[group_roots]
+        if all_displ.max() < TOL:
+            converged = True
         this_replica_dof_old = np.copy(this_replica_dof)
-        world.Barrier()
 
         # Re-apply  periodic   boundary  conditions   Note:  we   re-apply  the
         # conditions according to the  initial state, before the interpolation.
@@ -449,23 +483,9 @@ def main():
             [chunk_of_this_replica_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
             [this_replica_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE]
         )
-
-        # Find maximum displacement
-        all_displ = np.empty(world.size)
-        world.Allgather([my_displ, MPI.DOUBLE], [all_displ, MPI.DOUBLE])
-        all_displ = all_displ[group_roots]
-        if all_displ.max() < TOL:
-            converged = True
         this_lammps.scatter_atoms(
             "x", 1, 3, np.ctypeslib.as_ctypes(this_replica_dof)
         )
-        world.Barrier()
-        all_energies = np.empty(world.size)
-        world.Allgather(
-                [this_replica_energy, MPI.DOUBLE],
-                [all_energies, MPI.DOUBLE]
-        )
-        all_energies = all_energies[group_roots]
         if world.rank == 0:
             string_coords_history[step, :] = current_string_pos
             string_energy_history[step, :] = all_energies
