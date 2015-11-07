@@ -180,21 +180,24 @@ def main():
     dof_mask = [this_replica_atom_types == i for i in fixed_types]
     dof_mask = np.logical_or.reduce(dof_mask)
     fixed_dofs = np.where[dof_mask][0]
+    chunk_dof_mask = dof_mask[
+            dof_chunk_bounds[group.rank][0]:dof_chunk_bounds[group.rank][1]
+    ]
     chunk_of_this_replica_dof = ma.empty(dof_chunk_sizes[group.rank])
-    chunk_of_this_replica_dof.mask = dof_mask
+    chunk_of_this_replica_dof.mask = chunk_dof_mask
     chunk_of_this_replica_dof_old = ma.empty(dof_chunk_sizes[group.rank])
-    chunk_of_this_replica_dof_old.mask = dof_mask
+    chunk_of_this_replica_dof_old.mask = chunk_dof_mask
     if color > 0:
         chunk_of_left_replica_dof = ma.empty(dof_chunk_sizes[group.rank])
-        chunk_of_left_replica_dof = dof_mask
+        chunk_of_left_replica_dof = chunk_dof_mask
         chunk_of_right_replica_dof = ma.empty(dof_chunk_sizes[group.rank])
-        chunk_of_right_replica_dof = dof_mask
+        chunk_of_right_replica_dof = chunk_dof_mask
     chunk_of_tangent = ma.empty(dof_chunk_sizes[group.rank])
-    chunk_of_tangent = dof_mask
+    chunk_of_tangent = chunk_dof_mask
     chunk_of_this_replica_force = ma.empty(dof_chunk_sizes[group.rank])
-    chunk_of_this_replica_force = dof_mask
+    chunk_of_this_replica_force = chunk_dof_mask
     chunk_of_perp_force = ma.empty(dof_chunk_sizes[group.rank])
-    chunk_of_perp_force = dof_mask
+    chunk_of_perp_force = chunk_dof_mask
 
     # Initialize old coordinates and unwrap
     this_replica_dof_old = np.asarray(
@@ -500,8 +503,11 @@ def main():
 
     world.Barrier()
     # Write output data
-    this_lammps.command('dump 1 all custom 1 dump.replica_{:d} id type x y z c_PE_atom'.format(color))
-    this_lammps.command('dump_modify 1 pad 6 format "%.7d %d %22.14e %22.14e %22.14e %22.14e"')
+    this_lammps.command(
+            'dump 1 all custom 1'
+            + ' dump.replica_{:d} id type x y z c_PE_atom'.format(color))
+    this_lammps.command('dump_modify 1 pad 6'
+            + ' format "%.7d %d %22.14e %22.14e %22.14e %22.14e"')
     this_lammps.command('run 0 post no')
     this_lammps.close()
     if world.rank == 0:
