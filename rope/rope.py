@@ -22,11 +22,11 @@ The general workflow is as follows:
     instances are created  and initialized. Note that more than  one CPU can be
     associated with each Lammps instance, i.e. it is possible to parallelize on
     the replica level. - Second, the transition path is calculated iteratively.
-    The maximum  number of iterations  is max_string_iterations.  As the first  step in
-    each iteration, the equations of motion are integrated with Lammps. In each
-    iteration, num_lammps_steps timesteps are simulated. After integration, the
-    atomic  positions are  extracted and  the string  is reparameterized  using
-    linear interpolation.
+    The maximum  number of  iterations is  max_string_iterations. As  the first
+    step  in  each iteration,  the  equations  of  motion are  integrated  with
+    Lammps.  In  each  iteration,  num_lammps_steps  timesteps  are  simulated.
+    After integration,  the atomic  positions are extracted  and the  string is
+    reparameterized using linear interpolation.
 
 Note  that  in the  time  splitting  scheme proposed  in  the  paper of  Weinan
 and  coworkers,  the string  would  be  reparameterized after  every  timestep.
@@ -66,11 +66,12 @@ def main():
         raise ValueError('need at least three replicas')
     num_lammps_steps = 100  # Number of Lammps steps between interpolations
     max_string_iterations =  200    # Maximum number of reparameterizations
-    TOL = 1.0e-4            # Stop criterion (max. string displacement)
+    string_displacement_threshold = 1.0e-4            # Stop criterion (max. string displacement)
     num_atoms = 311040      # Number of atoms
     num_dof = num_atoms * 3 # Degrees of freedom
     fixed_types = [3, 4]
     periodic_boundary = [0, 0, 1]
+    measure_time = True
 
     # Split communicator into groups. Each group will simulate one replica.
     world = MPI.COMM_WORLD
@@ -86,25 +87,38 @@ def main():
     del(replica_association)
     group = world.Split(color=replica, key=world.rank)
     is_inner_replica = int(0 < replica < num_replicas - 1)
+    if group.rank == 0:
+        logfile = open('string.log.{:d}'.format(replica), 'w')
+    has_timer = measure_time and (world.rank == 0)
 
     # Get the ranks of the group-roots
     if group.rank == 0:
         flag = np.int(world.rank)
     else:
         flag = np.int(-1.0)
-    sendbuf = [np.array(flag, dtype=np.int), MPI.INT]
-    recvbuf = [np.zeros(world.size, dtype=np.int), MPI.INT]
-    world.Allgather(sendbuf, recvbuf)
+    group_root_flags = np.zeros(world.size, dtype=np.int)
+    world.Allgather(
+            sendbuf=[np.array(flag, dtype=np.int), MPI.INT],
+            recvbuf=[group_root_flags, MPI.INT]
+    )
     group_roots = np.empty(num_replicas, dtype=np.int)
     if world.rank == 0:
-        group_roots = np.asarray([i for i in recvbuf[0] if i>-1], dtype=np.int)
-    world.Bcast([group_roots, MPI.INT], root=0)
+        group_roots = np.asarray([i for i in group_root_flags[0] if i>-1], dtype=np.int)
+    world.Bcast(buf=[group_roots, MPI.INT], root=0)
+    if group.rank == 0:
+        logfile.write('MPI group roots:\t' + list_to_str(group_roots) + '\n')
 
     # Determine left and right neighbors in a ring-like MPI topology
     left_replica = np.roll(range(num_replicas), +1)[replica]
     right_replica = np.roll(range(num_replicas), -1)[replica]
     left_root = group_roots[left_replica]
     right_root = group_roots[right_replica]
+    if group.rank == 0:
+        logfile.write(
+                'Left and right MPI group root:\t{:d}'.format(
+                    left_root, right_root
+                )
+        )
     # Declare arrays for neighbor data
     left_energy = np.empty(1)
     right_energy = np.empty(1)
@@ -119,6 +133,8 @@ def main():
     comm_ptr = MPI._addressof(group)
     comm_val = MPI_Comm.from_address(comm_ptr)
     my_lammps = lammps(name="", cmdargs="", ptr=comm_val)
+    if group.rank == 0:
+        logfile.write('Generated Lammps instance\n')
 
     # Initialize replicas
     # Note: scatter_atoms requires an atom map
@@ -128,6 +144,8 @@ def main():
     setup = setup_template.substitute(c = replica)
     for line in setup.splitlines():
         my_lammps.command(line)
+    if group.rank == 0:
+        logfile.write('Initialized replicas\n')
 
     # Divide the 3N-dimensional array of atomic degrees of freedom (dof)
     # and the array of image flags into chunks. Each chunk is associated
@@ -154,6 +172,13 @@ def main():
     img_chunk_displ = [c[0] for c in img_chunk_bounds]
     img_chunk_sizes = [len(range(c[0], c[1])) for c in img_chunk_bounds]
     img_chunk = np.empty(img_chunk_sizes[group.rank], dtype=np.int32)
+    if group.rank == 0:
+        logfile.write('Chunks for degrees of freedom:\n')
+        for i, bound in enumerate(dof_chunk_bounds):
+            logfile.write(
+                    '{:d}\t{:d}\t({:d} DOFs)\n'.format(
+                    bound[0], bound[1], dof_chunk_sizes[i])
+            )
 
     # Calculate size of the box
     box_size = np.zeros(3)
@@ -163,6 +188,8 @@ def main():
     box_size[1] -= my_lammps.extract_global("boxylo", 1)
     box_size[2] += my_lammps.extract_global("boxzhi", 1)
     box_size[2] -= my_lammps.extract_global("boxzlo", 1)
+    if group.rank == 0:
+        logfile.write('Box edge length:\t' + list_to_str(box_size) + "\n")
 
     # Declare chunks as masked
     # Note: masks are preserved in Scatterv / Gatherv operations.
@@ -189,8 +216,10 @@ def main():
     chunk_of_tangent = chunk_of_dof_mask
     chunk_of_my_force = ma.empty(dof_chunk_sizes[group.rank])
     chunk_of_my_force = chunk_of_dof_mask
-    chunk_of_perp_force = ma.empty(dof_chunk_sizes[group.rank])
-    chunk_of_perp_force = chunk_of_dof_mask
+    chunk_of_perpendicular_force = ma.empty(dof_chunk_sizes[group.rank])
+    chunk_of_perpendicular_force = chunk_of_dof_mask
+    if group.rank == 0:
+        logfile.write('Masked chunks\n')
 
     # Initialize old coordinates and unwrap
     my_dof_old = np.asarray(my_lammps.gather_atoms("x", 1, 3))
@@ -214,18 +243,19 @@ def main():
         [my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
         root=0
     )
+    if group.rank == 0:
+        logfile.write('Initialized old coordinates\n')
 
-    # Rank 0 stores the convergence history
-    if world.rank == 0:
-        parameterization_log = np.zeros((max_string_iterations, num_replicas))
-        energy_log = np.zeros((max_string_iterations, num_replicas))
-        displacement_log = np.zeros((max_string_iterations, num_replicas))
     converged = False
     world.Barrier()
     minimize_command = "minimize 0 1e-8 {:d} {:d}".format(
             num_lammps_steps, num_lammps_steps
     )
-    for step in range(max_string_iterations):
+    if has_timer:
+        timer = Timer()
+    for iteration in range(max_string_iterations):
+        if has_timer:
+            timer.stamp()
         # Evolve replica
         my_lammps.command(minimize_command)
         my_lammps.command("velocity all set 0.0 0.0 0.0")
@@ -237,9 +267,12 @@ def main():
         my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
         my_force = np.asarray(my_lammps.gather_atoms("f", 1, 3))
         my_energy = np.asarray(my_lammps.extract_variable("PE", "all", 0))
-        all_energies = np.empty(world.size)
-        world.Allgather([my_energy, MPI.DOUBLE], [all_energies, MPI.DOUBLE])
-        all_energies = all_energies[group_roots]
+        energies = np.empty(world.size)
+        world.Allgather(
+                sendbuf=[my_energy, MPI.DOUBLE],
+                recvbuf=[energies, MPI.DOUBLE]
+        )
+        energies = energies[group_roots]
         # Unwrap atom positions
         group.Scatterv(
             [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
@@ -261,6 +294,13 @@ def main():
             root=0
         )
         world.Barrier()
+        if group.rank == 0:
+            logfile.write('Minimized energy and applied pbc\n')
+        if has_timer:
+            timer.stamp()
+            logfile.write(
+                'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
+            )
 
         # Get coordinates and energy of left and right neighbor
         if (group.rank == 0):
@@ -284,11 +324,15 @@ def main():
         # Compute distance to left neighbor
         if (replica > 0):
             group.Scatterv(
-                [left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                chunk_of_left_dof, root=0)
+                sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                recvbuf=chunk_of_left_dof,
+                root=0
+            )
             group.Scatterv(
-                [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                chunk_of_my_dof, root=0)
+                sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                recvbuf=chunk_of_my_dof,
+                root=0
+            )
             chunk_dist_left, distance_to_left = calc_chunk_distance(
                     chunk_of_my_dof, chunk_of_left_dof, group)
         else:
@@ -323,7 +367,7 @@ def main():
             group.Allreduce(
                 [chunk_projection, MPI.DOUBLE],
                 [my_projection, MPI.DOUBLE], op=MPI.SUM)
-            chunk_of_perp_force, norm_of_perp_force = calc_chunk_distance(
+            chunk_of_perpendicular_force, norm_of_perpendicular_force = calc_chunk_distance(
                     chunk_of_my_force, my_projection * chunk_of_tangent, group)
 
         # Compute total length of string
@@ -336,18 +380,36 @@ def main():
         # Determine the positions of the replicas on the string
         parameterization = np.empty(world.size)
         world.Allgather(
-                [distance_to_left, MPI.DOUBLE],
-                [parameterization, MPI.DOUBLE])
+                sendbuf=[distance_to_left, MPI.DOUBLE],
+                recvbuf=[parameterization, MPI.DOUBLE]
+        )
         parameterization = parameterization[group_roots]
         parameterization = np.cumsum(parameterization, out=parameterization)
-        parameterization /= parameterization[-1]
+        length = parameterization[-1]
+        parameterization /= length
         # Calculate ideal replica positions.
         # If the current positions are energy-weighted, then then target
         # positions must be weighted, too.
-        sendbuf = np.array(float(replica + 1) / float(num_replicas))
+        my_target_parameter = np.array(float(replica + 1) / float(num_replicas))
         target_parameterization = np.empty(world.size)
-        world.Allgather([sendbuf, MPI.DOUBLE], [target_parameterization, MPI.DOUBLE])
+        world.Allgather(
+                sendbuf=[np.array(my_target_parameter), MPI.DOUBLE],
+                recvbuf=[target_parameterization, MPI.DOUBLE]
+        )
         target_parameterization = target_parameterization[group_roots]
+        if group.rank == 0:
+            logfile.write(
+                'Parameterization:\t' + list_to_str(parameterization) + '\n'
+            )
+            logfile.write(
+                'Target parameterization:\t'
+                + list_to_str(target_parameterization) + '\n'
+            )
+        if has_timer:
+            timer.stamp()
+            logfile.write(
+                'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
+            )
 
         # Determine which replica is associated with the interval
         # in which the new position lies and request interpolation
@@ -369,6 +431,13 @@ def main():
             }
         else:
             y = {dest: None for dest in my_dest}
+        if group.rank == 0:
+            logfile.write(
+                'Interpolation source:\t' + str(my_source) + '\n'
+            )
+            logfile.write(
+                'Interpolation destinations:\t' + list_to_str(my_dest) + '\n'
+            )
         world.Barrier()
 
         # Perform interpolations in the associated interval
@@ -390,8 +459,14 @@ def main():
                         [y[dest], dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
                         root=0
                     )
-        print('#replica {:d} my dests'.format(replica), my_dest)
         world.Barrier()
+        if group.rank == 0:
+            logfile.write('Finished interpolations\n')
+        if has_timer:
+            timer.stamp()
+            logfile.write(
+                'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
+            )
 
         # Communicate interpolated values to the replicas which will use them
         # Must only receive and send if my_source != replica
@@ -400,13 +475,17 @@ def main():
         if (group.rank == 0 and replica > 0):
             requests = []
             for i, dest in enumerate(my_dest):
-                requests.append(world.Isend(
+                my_request = world.Isend(
                     buf=[y[dest], num_atoms, MPI.DOUBLE],
-                    dest=group_roots[dest], tag=group_roots[dest]))
+                    dest=group_roots[dest], tag=group_roots[dest]
+                )
+                requests.append(my_request)
             if is_inner_replica and (my_source != replica):
-                requests.append(world.Irecv(
+                my_request = world.Irecv(
                     buf=[my_dof, num_atoms, MPI.DOUBLE],
-                    source=group_roots[my_source], tag=world.rank))
+                    source=group_roots[my_source], tag=world.rank
+                )
+                requests.append(my_request)
             re = MPI.Request.Waitall(requests)
 
         # Reset coordinates  of atoms with  fixed dofs. This is  necessary even
@@ -422,16 +501,26 @@ def main():
             chunk_of_my_dof_old, root=0)
 
         # Compute displacement of this replica
-        (_, my_displ) = calc_chunk_distance(
+        (_, my_displacement) = calc_chunk_distance(
                 chunk_of_my_dof,
                 chunk_of_my_dof_old
         )
         # Find maximum displacement
-        all_displ = np.empty(world.size)
-        world.Allgather([my_displ, MPI.DOUBLE], [all_displ, MPI.DOUBLE])
-        all_displ = all_displ[group_roots]
-        if all_displ.max() < TOL:
+        displacements = np.empty(world.size)
+        world.Allgather(
+                sendbuf=[my_displacement, MPI.DOUBLE],
+                recvbuf=[displacements, MPI.DOUBLE]
+        )
+        displacements = displacements[group_roots]
+        max_displacement = displacements.max()
+        if group.rank == 0:
+            logfile.write('Maximum displacement:\t{:.3e}\n'.format(
+                max_displacement)
+            )
+        if max_displacement < string_displacement_threshold:
             converged = True
+            if group.rank == 0:
+                logfile.write('Converged\n')
         my_dof_old = np.copy(my_dof)
 
         # Re-apply  periodic   boundary  conditions   Note:  we   re-apply  the
@@ -444,21 +533,16 @@ def main():
             chunk_of_my_dof, periodic_boundary, image_distances, 'wrap'
         )
         group.Allgatherv(
-            [chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-            [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE]
+            sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+            recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE]
         )
         my_lammps.scatter_atoms(
             "x", 1, 3, np.ctypeslib.as_ctypes(my_dof)
         )
         if world.rank == 0:
-            parameterization_log[step, :] = parameterization
-            energy_log[step, :] = all_energies
-            displacement_log[step, :] = all_displ
-        if world.rank == 0:
-            print('Maximum displacement: ' + str(all_displ.max()))
-            out =  ['{:.8f}'.format(energy) for energy in all_energies]
-            print('#Replica energies:' + ' '.join(out))
-        print('#replica / converged', replica, converged)
+            save_reaction_path(
+                iteration, length, parameterization, energies, displacements
+            )
         world.Barrier()
         if converged: break
 
@@ -471,10 +555,6 @@ def main():
             + ' format "%.7d %d %22.14e %22.14e %22.14e %22.14e"')
     my_lammps.command('run 0 post no')
     my_lammps.close()
-    if world.rank == 0:
-        np.savetxt('parameterization.npy', parameterization_log[:step+1])
-        np.savetxt('energy.npy', energy_log[:step+1])
-        np.savetxt('displacement_log.npy', displacement_log[:step+1])
 
 def calc_chunk_distance(chunk1, chunk2, comm):
     """Calculate the distance between two chunks of data.
@@ -488,10 +568,11 @@ def calc_chunk_distance(chunk1, chunk2, comm):
     """
     chunk_distance = chunk1 - chunk2
     squares = chunk_distance * chunk_distance
-    sendbuf = np.array(squares.sum())
     norm_of_chunk_distance = np.empty(1)
-    comm.Allreduce([sendbuf, MPI.DOUBLE],
-        [norm_of_chunk_distance, MPI.DOUBLE], op=MPI.SUM)
+    comm.Allreduce(
+        sendbuf=[np.array(squares.sum()), MPI.DOUBLE],
+        recvbuf=[norm_of_chunk_distance, MPI.DOUBLE],
+        op=MPI.SUM)
     norm_of_chunk_distance = np.sqrt(norm_of_chunk_distance)
     return (chunk_distance, norm_of_chunk_distance)
 
@@ -563,9 +644,57 @@ def apply_pbc(dof, periodic_boundary, image_distances, mode):
         raise ValueError('Wrong mode: {:s}'.format(mode))
     return dof
 
-def safe_template_string(multiline_string):
-    """ Put multiline lammps commands on a single line.
+def save_reaction_path(
+        iteration, length, parameterization, energies, displacements):
+    """Save reaction path data to disk.
+
+    Args:
+        length (float): length of the string
+        parameterization (ndarray): current string parameterization
+        energies (ndarray): energies of replicas
+        displacements (ndarray): norms of displacements of each replica
     """
+    if iteration == 0:
+        with open('length.txt', 'w') as file:
+            file.write('#Length of string')
+        with open('parameterization.txt', 'w') as file:
+            file.write('#Position of replicas 1,2...N')
+        with open('energies.txt', 'w') as file:
+            file.write('#Energy of replicas 1,2,...N')
+        with open('displacements.txt', 'w') as file:
+            file.write('#Displacement of replica 1,2,...N')
+    with open('length.txt', 'a') as file:
+        file.write('{:.8e}'.format(length) + '\n')
+    with open('parameterization.txt', 'a') as file:
+        line = vector_to_str(parameterization)
+        file.write(line)
+    with open('energies.txt', 'a') as file:
+        line = vector_to_str(energies)
+        file.write(line)
+    with open('displacements.txt', 'a') as file:
+        line = vector_to_str(displacements)
+        file.write(line)
+
+def vector_to_str(my_array, delimiter=' ', float_format='{:.8e}'):
+    """Format the elements of a vector and return a string"""
+    line = list(map(float_format.format, np.ravel(my_array)))
+    line = delimiter.join(line)
+    line += '\n'
+    return line
+
+def list_to_str(my_list, delimiter=" "):
+    """Print a string with the list elements
+
+    Args:
+        my_list (list)
+        delimiter (str): delimiter of list elements in string
+    """
+    return delimiter.join(map(str, my_list))
+
+def safe_template_string(multiline_string):
+
+    """ Put multiline lammps commands on a single line."""
+
     safe_template_string = ""
     for line in multiline_string.splitlines():
         if line.rstrip().endswith("&"):
@@ -576,6 +705,18 @@ def safe_template_string(multiline_string):
 
 class CustomTemplate(Template):
         delimiter = "?"
+
+class Timer():
+
+    """Timer for MPI"""
+
+    def __init__(self):
+        self.wtime = MPI.Wtime()
+        self.elapsed_time = 0.0
+    def stamp(self):
+        current_time = MPI.Wtime()
+        self.elapsed_time = current_time - self.wtime
+        self.wtime = current_time
 
 if __name__ == '__main__':
     main()
