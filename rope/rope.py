@@ -72,9 +72,9 @@ def main():
     num_atoms = config.getint('setup', 'num_atoms')
     num_dof = num_atoms * 3 # Degrees of freedom
     fixed_types = config.get('setup', 'fixed_types')
-    fixed_types = [int(i) for i in str.split(fixed_types)]
+    fixed_types = [int(i) for i in fixed_types.split(' ')]
     periodic_boundary = config.get('setup', 'periodic_boundary')
-    periodic_boundary = [int(i) for i in str.split(periodic_boundary)]
+    periodic_boundary = [int(i) for i in periodic_boundary.split(' ')]
     if len(periodic_boundary) != 3:
         raise ValueError('Wrong periodic boundary information')
     num_lammps_iterations = config.getint('run', 'num_lammps_iterations')
@@ -112,7 +112,7 @@ def main():
     )
     group_roots = np.empty(num_replicas, dtype=np.int)
     if world.rank == 0:
-        group_roots = np.asarray([i for i in group_root_flags[0] if i>-1], dtype=np.int)
+        group_roots = np.asarray([i for i in group_root_flags if i>-1], dtype=np.int)
     world.Bcast(buf=[group_roots, MPI.INT], root=0)
     if group.rank == 0:
         logfile.write('MPI group roots:\t' + list_to_str(group_roots) + '\n')
@@ -124,13 +124,13 @@ def main():
     right_root = group_roots[right_replica]
     if group.rank == 0:
         logfile.write(
-                'Left and right MPI group root:\t{:d}'.format(
+                'Left and right MPI group root:\t{:d}\t{:d}\n'.format(
                     left_root, right_root
                 )
         )
     # Declare arrays for neighbor data
-    left_energy = np.empty(1)
-    right_energy = np.empty(1)
+    left_energy = np.empty(1, dtype=float)
+    right_energy = np.empty(1, dtype=float)
     left_dof = np.empty(num_dof)
     right_dof = np.empty(num_dof)
 
@@ -208,7 +208,7 @@ def main():
     my_atom_types = my_atom_types.reshape((-1,),order='F')
     dof_mask = [my_atom_types == i for i in fixed_types]
     dof_mask = np.logical_or.reduce(dof_mask)
-    fixed_dofs = np.where[dof_mask][0]
+    fixed_dofs = np.where(dof_mask)[0]
     chunk_of_dof_mask = dof_mask[
             dof_chunk_bounds[group.rank][0]:dof_chunk_bounds[group.rank][1]
     ]
@@ -218,15 +218,15 @@ def main():
     chunk_of_my_dof_old.mask = chunk_of_dof_mask
     if replica > 0:
         chunk_of_left_dof = ma.empty(dof_chunk_sizes[group.rank])
-        chunk_of_left_dof = chunk_of_dof_mask
+        chunk_of_left_dof.mask = chunk_of_dof_mask
         chunk_of_right_dof = ma.empty(dof_chunk_sizes[group.rank])
-        chunk_of_right_dof = chunk_of_dof_mask
+        chunk_of_right_dof.mask = chunk_of_dof_mask
     chunk_of_tangent = ma.empty(dof_chunk_sizes[group.rank])
-    chunk_of_tangent = chunk_of_dof_mask
+    chunk_of_tangent.mask = chunk_of_dof_mask
     chunk_of_my_force = ma.empty(dof_chunk_sizes[group.rank])
-    chunk_of_my_force = chunk_of_dof_mask
+    chunk_of_my_force.mask = chunk_of_dof_mask
     chunk_of_perpendicular_force = ma.empty(dof_chunk_sizes[group.rank])
-    chunk_of_perpendicular_force = chunk_of_dof_mask
+    chunk_of_perpendicular_force.mask = chunk_of_dof_mask
     if group.rank == 0:
         logfile.write('Masked chunks\n')
 
@@ -276,12 +276,6 @@ def main():
         my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
         my_force = np.asarray(my_lammps.gather_atoms("f", 1, 3))
         my_energy = np.asarray(my_lammps.extract_variable("PE", "all", 0))
-        energies = np.empty(world.size)
-        world.Allgather(
-                sendbuf=[my_energy, MPI.DOUBLE],
-                recvbuf=[energies, MPI.DOUBLE]
-        )
-        energies = energies[group_roots]
         # Unwrap atom positions
         group.Scatterv(
             [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
@@ -302,7 +296,15 @@ def main():
             [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
             root=0
         )
-        world.Barrier()
+        energies = np.empty(world.size)
+        world.Allgather(
+                sendbuf=[my_energy, MPI.DOUBLE],
+                recvbuf=[energies, MPI.DOUBLE]
+        ) # Implicit world.Barrier
+        energies = energies[group_roots]
+        left_energy = np.roll(energies, +1)[replica]
+        my_energy = energies[replica]
+        right_energy = np.roll(energies, -1)[replica]
         if group.rank == 0:
             logfile.write('Minimized energy and applied pbc\n')
         if has_timer:
@@ -318,16 +320,8 @@ def main():
                 recvbuf=[left_dof, MPI.DOUBLE], source=left_root
             )
             world.Sendrecv(
-                sendbuf=[my_energy, MPI.DOUBLE], dest=right_root,
-                recvbuf=[left_energy, MPI.DOUBLE], source=left_root
-            )
-            world.Sendrecv(
                 sendbuf=[my_dof, MPI.DOUBLE], dest=left_root,
                 recvbuf=[right_dof, MPI.DOUBLE], source=right_root
-            )
-            world.Sendrecv(
-                sendbuf=[my_energy, MPI.DOUBLE], dest=left_root,
-                recvbuf=[right_energy, MPI.DOUBLE], source=right_root
             )
 
         # Compute distance to left neighbor
@@ -347,11 +341,23 @@ def main():
         else:
             distance_to_left = 0.0
 
+        # Todo: compute the force components also for the initial and the final replica, 
+        # taking forward and backward differences
         # Compute the tangent vector and the force perpendicular to the path
         if is_inner_replica:
+            if group.rank == 0:
+                logfile.write(
+                    'Tangent computation. Energies:\t{:.3f}\t{:.3f}\t{:.3f}\n'.format(
+                        left_energy, my_energy, right_energy
+                    )
+                )
             if (left_energy > my_energy > right_energy):
+                if group.rank == 0:
+                    logfile.write('Backward difference\n')
                 chunk_of_tangent = chunk_dist_left / distance_to_left
             elif (left_energy < my_energy < right_energy):
+                if group.rank == 0:
+                    logfile.write('Forward difference\n')
                 group.Scatterv(
                     [right_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
                     chunk_of_right_dof, root=0)
@@ -359,6 +365,8 @@ def main():
                         chunk_of_right_dof, chunk_of_my_dof, group)
                 chunk_of_tangent = chunk_dist / norm_of_distance
             else:
+                if group.rank == 0:
+                    logfile.write('Central difference\n')
                 group.Scatterv(
                     [right_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
                     chunk_of_right_dof, root=0)
@@ -372,12 +380,40 @@ def main():
                     ma.ravel(chunk_of_my_force),
                     ma.ravel(chunk_of_tangent)
             )
-            my_projection = np.empty(1)
+            my_tangential_force = np.empty(1)
             group.Allreduce(
                 [chunk_projection, MPI.DOUBLE],
-                [my_projection, MPI.DOUBLE], op=MPI.SUM)
+                [my_tangential_force, MPI.DOUBLE], op=MPI.SUM)
             chunk_of_perpendicular_force, norm_of_perpendicular_force = calc_chunk_distance(
-                    chunk_of_my_force, my_projection * chunk_of_tangent, group)
+                    chunk_of_my_force, my_tangential_force * chunk_of_tangent, group)
+            if group.rank == 0:
+                logfile.write(
+                    'Projection of force on tangent:\t{:.4e}\n'.format(
+                        my_tangential_force[0]
+                    )
+                )
+                logfile.write(
+                    'Norm of perpendicular force:\t{:.4e}\n'.format(
+                        norm_of_perpendicular_force[0]
+                    )
+                )
+
+        # Todo: eliminate Allgather by sending from group roots to world rank 0 instead
+        else:
+            my_tangential_force = np.zeros(1)
+            norm_of_perpendicular_force = np.zeros(1)
+        tangential_forces = np.empty(world.size)
+        world.Allgather(
+                sendbuf=[my_tangential_force, MPI.DOUBLE],
+                recvbuf=[tangential_forces, MPI.DOUBLE]
+        )
+        tangential_forces = tangential_forces[group_roots]
+        perpendicular_forces = np.empty(world.size)
+        world.Allgather(
+                sendbuf=[norm_of_perpendicular_force, MPI.DOUBLE],
+                recvbuf=[perpendicular_forces, MPI.DOUBLE]
+        )
+        perpendicular_forces = perpendicular_forces[group_roots]
 
         # Compute total length of string
         # Here, we would weight by energy. The factor 1.0 is a placeholder.
@@ -512,7 +548,8 @@ def main():
         # Compute displacement of this replica
         (_, my_displacement) = calc_chunk_distance(
                 chunk_of_my_dof,
-                chunk_of_my_dof_old
+                chunk_of_my_dof_old,
+                group
         )
         # Find maximum displacement
         displacements = np.empty(world.size)
@@ -550,7 +587,8 @@ def main():
         )
         if world.rank == 0:
             save_reaction_path(
-                iteration, length, parameterization, energies, displacements
+                iteration, length, parameterization, energies, displacements,
+                tangential_forces, perpendicular_forces
             )
         world.Barrier()
         if converged: break
@@ -645,16 +683,19 @@ def apply_pbc(dof, periodic_boundary, image_distances, mode):
     directions = range(3)
     if mode == 'unwrap':
         for i in directions:
-            dof[i::3] += image_distances[i]
+            if periodic_boundary[i]:
+                dof[i::3] += image_distances[i]
     elif mode == 'wrap':
         for i in directions:
-            dof[i::3] -= image_distances[i]
+            if periodic_boundary[i]:
+                dof[i::3] -= image_distances[i]
     else:
         raise ValueError('Wrong mode: {:s}'.format(mode))
     return dof
 
 def save_reaction_path(
-        iteration, length, parameterization, energies, displacements):
+        iteration, length, parameterization, energies, displacements,
+        tangential_forces, perpendicular_forces):
     """Save reaction path data to disk.
 
     Args:
@@ -665,13 +706,17 @@ def save_reaction_path(
     """
     if iteration == 0:
         with open('length.txt', 'w') as file:
-            file.write('#Length of string')
+            file.write('#Length of string\n')
         with open('parameterization.txt', 'w') as file:
-            file.write('#Position of replicas 1,2...N')
+            file.write('#Position of replicas 1,2...N\n')
         with open('energies.txt', 'w') as file:
-            file.write('#Energy of replicas 1,2,...N')
+            file.write('#Energy of replicas 1,2,...N\n')
         with open('displacements.txt', 'w') as file:
-            file.write('#Displacement of replica 1,2,...N')
+            file.write('#Displacement of replica 1,2,...N\n')
+        with open('tangential_forces.txt', 'w') as file:
+            file.write('#Tangential force of replica 1,2,...N\n')
+        with open('perpendicular_forces.txt', 'w') as file:
+            file.write('#Perpendicular force of replica 1,2,...N\n')
     with open('length.txt', 'a') as file:
         file.write('{:.8e}'.format(length) + '\n')
     with open('parameterization.txt', 'a') as file:
@@ -682,6 +727,12 @@ def save_reaction_path(
         file.write(line)
     with open('displacements.txt', 'a') as file:
         line = vector_to_str(displacements)
+        file.write(line)
+    with open('tangential_forces.txt', 'a') as file:
+        line = vector_to_str(tangential_forces)
+        file.write(line)
+    with open('perpendicular_forces.txt', 'a') as file:
+        line = vector_to_str(perpendicular_forces)
         file.write(line)
 
 def vector_to_str(my_array, delimiter=' ', float_format='{:.8e}'):
