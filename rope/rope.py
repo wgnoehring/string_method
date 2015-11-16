@@ -17,16 +17,15 @@ Synopsis
 This is a prototype implementation of the modified string method, see Weinan et
 al. The Journal of Chemical Physics 126, 164103 2007.
 
-The general workflow is as follows:
-    - First, MPI  communicators are set up and a  number of num_replicas Lammps
-    instances are created  and initialized. Note that more than  one CPU can be
-    associated with each Lammps instance, i.e. it is possible to parallelize on
-    the replica level. - Second, the transition path is calculated iteratively.
-    The maximum  number of  iterations is  max_string_iterations. As  the first
-    step  in  each iteration,  the  equations  of  motion are  integrated  with
-    Lammps.  In  each  iteration,  num_lammps_steps  timesteps  are  simulated.
-    After integration,  the atomic  positions are extracted  and the  string is
-    reparameterized using linear interpolation.
+The general  workflow is as  follows: First, MPI  communicators are set  up and
+a  number  of  num_replicas  Lammps  instances  are  created  and  initialized.
+Note  that more  than one  CPU  can be  associated with  each Lammps  instance,
+i.e.  it  is  possible  to  parallelize  on  the  replica  level.  Second,  the
+transition path is calculated iteratively.  The maximum number of iterations is
+max_string_iterations. As  the first step  in each iteration, the  equations of
+motion are integrated with Lammps (using num_lammps_iterations sub-iterations).
+After  integration,  the atomic  positions  are  extracted  and the  string  is
+reparameterized using linear interpolation.
 
 Note  that  in the  time  splitting  scheme proposed  in  the  paper of  Weinan
 and  coworkers,  the string  would  be  reparameterized after  every  timestep.
@@ -57,21 +56,31 @@ import numpy as np
 from numpy import ma as ma
 from lammps import lammps
 from string import Template
+import configparser
+import sys
 import ctypes
 
 def main():
-    # Options:
-    num_replicas = 16       # Number of replicas
+    # Parse configuration file
+    configfile = sys.argv[1]
+    config = configparser.ConfigParser()
+    config.read(configfile)
+    setup_file = config.get('setup', 'setup_file')
+    num_replicas = config.getint('setup', 'num_replicas')
     if (num_replicas < 3):
         raise ValueError('need at least three replicas')
-    num_lammps_steps = 100  # Number of Lammps steps between interpolations
-    max_string_iterations =  200    # Maximum number of reparameterizations
-    string_displacement_threshold = 1.0e-4            # Stop criterion (max. string displacement)
-    num_atoms = 311040      # Number of atoms
+    num_atoms = config.getint('setup', 'num_atoms')
     num_dof = num_atoms * 3 # Degrees of freedom
-    fixed_types = [3, 4]
-    periodic_boundary = [0, 0, 1]
-    measure_time = True
+    fixed_types = config.get('setup', 'fixed_types')
+    fixed_types = [int(i) for i in str.split(fixed_types)]
+    periodic_boundary = config.get('setup', 'periodic_boundary')
+    periodic_boundary = [int(i) for i in str.split(periodic_boundary)]
+    if len(periodic_boundary) != 3:
+        raise ValueError('Wrong periodic boundary information')
+    num_lammps_iterations = config.getint('run', 'num_lammps_iterations')
+    max_string_iterations = config.getint('run', 'max_string_iterations')
+    string_displacement_threshold = config.getfloat('run', 'string_displacement_threshold')
+    measure_time = config.getboolean('run', 'measure_time')
 
     # Split communicator into groups. Each group will simulate one replica.
     world = MPI.COMM_WORLD
@@ -138,9 +147,9 @@ def main():
 
     # Initialize replicas
     # Note: scatter_atoms requires an atom map
-    with open("in.lammps.string") as myfile:
-        lammps_setup_file = myfile.read()
-    setup_template = safe_template_string(lammps_setup_file)
+    with open(setup_file) as file:
+        setup_template = file.read()
+    setup_template = safe_template_string(setup_template)
     setup = setup_template.substitute(c = replica)
     for line in setup.splitlines():
         my_lammps.command(line)
@@ -249,7 +258,7 @@ def main():
     converged = False
     world.Barrier()
     minimize_command = "minimize 0 1e-8 {:d} {:d}".format(
-            num_lammps_steps, num_lammps_steps
+            num_lammps_iterations, num_lammps_iterations
     )
     if has_timer:
         timer = Timer()
