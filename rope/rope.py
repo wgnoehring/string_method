@@ -69,6 +69,8 @@ def main():
     num_replicas = config.getint('setup', 'num_replicas')
     if (num_replicas < 3):
         raise ValueError('need at least three replicas')
+    first_replica = 0
+    last_replica = num_replicas - 1
     num_atoms = config.getint('setup', 'num_atoms')
     num_dof = num_atoms * 3 # Degrees of freedom
     fixed_types = config.get('setup', 'fixed_types')
@@ -95,7 +97,7 @@ def main():
             break
     del(replica_association)
     group = world.Split(color=replica, key=world.rank)
-    is_inner_replica = int(0 < replica < num_replicas - 1)
+    is_inner_replica = int(first_replica < replica < last_replica)
     if group.rank == 0:
         logfile = open('string.log.{:d}'.format(replica), 'w')
     has_timer = measure_time and (world.rank == 0)
@@ -291,9 +293,12 @@ def main():
         chunk_of_my_dof = apply_pbc(
             chunk_of_my_dof, periodic_boundary, image_distances, 'unwrap'
         )
+        # Note: after Gatherv, my_dof is inconsistent in the group
+        # This incosistency will be eliminated when the group root
+        # receives the interpolated vector and scatters to chunks.
         group.Gatherv(
-            [chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-            [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+            sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+            recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
             root=0
         )
         energies = np.empty(world.size)
@@ -313,7 +318,7 @@ def main():
                 'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
             )
 
-        # Get coordinates and energy of left and right neighbor
+        # Get coordinates of left and right neighbor
         if (group.rank == 0):
             world.Sendrecv(
                 sendbuf=[my_dof, MPI.DOUBLE], dest=right_root,
@@ -323,85 +328,75 @@ def main():
                 sendbuf=[my_dof, MPI.DOUBLE], dest=left_root,
                 recvbuf=[right_dof, MPI.DOUBLE], source=right_root
             )
-
-        # Compute distance to left neighbor
-        if (replica > 0):
+        if  (replica > first_replica):
             group.Scatterv(
                 sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
                 recvbuf=chunk_of_left_dof,
                 root=0
             )
+        if (replica < last_replica):
             group.Scatterv(
-                sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                recvbuf=chunk_of_my_dof,
+                sendbuf=[right_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                recvbuf=chunk_of_right_dof,
                 root=0
             )
-            chunk_dist_left, distance_to_left = calc_chunk_distance(
-                    chunk_of_my_dof, chunk_of_left_dof, group)
-        else:
-            distance_to_left = 0.0
 
-        # Todo: compute the force components also for the initial and the final replica, 
-        # taking forward and backward differences
-        # Compute the tangent vector and the force perpendicular to the path
-        if is_inner_replica:
-            if group.rank == 0:
-                logfile.write(
-                    'Tangent computation. Energies:\t{:.3f}\t{:.3f}\t{:.3f}\n'.format(
-                        left_energy, my_energy, right_energy
-                    )
+        # Compute 'improved' estimate of tangent vector, see
+        # Henkelman, Jonsson, JChemPhys 2000, 113 (22), 9978.
+        energy_increases_monotonously = (left_energy < my_energy < right_energy)
+        energy_decreases_monotonously = (left_energy > my_energy > right_energy)
+        if group.rank == 0:
+            logfile.write(
+                'Tangent computation. Energies:\t'
+                +'{:.3f}\t{:.3f}\t{:.3f}\n'.format(
+                    left_energy, my_energy, right_energy
                 )
-            if (left_energy > my_energy > right_energy):
-                if group.rank == 0:
-                    logfile.write('Backward difference\n')
-                chunk_of_tangent = chunk_dist_left / distance_to_left
-            elif (left_energy < my_energy < right_energy):
-                if group.rank == 0:
-                    logfile.write('Forward difference\n')
-                group.Scatterv(
-                    [right_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                    chunk_of_right_dof, root=0)
-                chunk_dist, norm_of_distance = calc_chunk_distance(
-                        chunk_of_right_dof, chunk_of_my_dof, group)
-                chunk_of_tangent = chunk_dist / norm_of_distance
-            else:
-                if group.rank == 0:
-                    logfile.write('Central difference\n')
-                group.Scatterv(
-                    [right_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                    chunk_of_right_dof, root=0)
-                chunk_dist, norm_of_distance = calc_chunk_distance(
-                        chunk_of_right_dof, chunk_of_left_dof, group)
-                chunk_of_tangent = chunk_dist / norm_of_distance
-            group.Scatterv(
-                [my_force, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                chunk_of_my_force, root=0)
-            chunk_projection = ma.dot(
-                    ma.ravel(chunk_of_my_force),
-                    ma.ravel(chunk_of_tangent)
             )
-            my_tangential_force = np.empty(1)
-            group.Allreduce(
-                [chunk_projection, MPI.DOUBLE],
-                [my_tangential_force, MPI.DOUBLE], op=MPI.SUM)
-            chunk_of_perpendicular_force, norm_of_perpendicular_force = calc_chunk_distance(
-                    chunk_of_my_force, my_tangential_force * chunk_of_tangent, group)
+        if (replica == first_replica) or energy_increases_monotonously:
             if group.rank == 0:
-                logfile.write(
-                    'Projection of force on tangent:\t{:.4e}\n'.format(
-                        my_tangential_force[0]
-                    )
-                )
-                logfile.write(
-                    'Norm of perpendicular force:\t{:.4e}\n'.format(
-                        norm_of_perpendicular_force[0]
-                    )
-                )
-
-        # Todo: eliminate Allgather by sending from group roots to world rank 0 instead
+                logfile.write('Forward difference\n')
+            chunk1 = chunk_of_right_dof
+            chunk2 = chunk_of_my_dof
+        elif (replica == last_replica) or energy_decreases_monotonously:
+            if group.rank == 0:
+                logfile.write('Backward difference\n')
+            chunk1 = chunk_of_my_dof
+            chunk2 = chunk_of_left_dof
         else:
-            my_tangential_force = np.zeros(1)
-            norm_of_perpendicular_force = np.zeros(1)
+            if group.rank == 0:
+                logfile.write('Central difference\n')
+            chunk1 = chunk_of_right_dof
+            chunk2 = chunk_of_left_dof
+        chunk_distance, norm_of_chunk_distance = calc_chunk_distance(
+                chunk1, chunk2, group
+        )
+        chunk_of_tangent = chunk_distance / norm_of_chunk_distance
+
+        # Compute tangential and perpendicular force
+        group.Scatterv(
+            [my_force, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+            chunk_of_my_force, root=0)
+        chunk_projection = ma.dot(
+                ma.ravel(chunk_of_my_force),
+                ma.ravel(chunk_of_tangent)
+        )
+        my_tangential_force = np.empty(1)
+        group.Allreduce(
+            [chunk_projection, MPI.DOUBLE],
+            [my_tangential_force, MPI.DOUBLE], op=MPI.SUM)
+        chunk_of_perpendicular_force, norm_of_perpendicular_force = calc_chunk_distance(
+                chunk_of_my_force, my_tangential_force * chunk_of_tangent, group)
+        if group.rank == 0:
+            logfile.write(
+                'Projection of force on tangent:\t{:.4e}\n'.format(
+                    my_tangential_force[0]
+                )
+            )
+            logfile.write(
+                'Norm of perpendicular force:\t{:.4e}\n'.format(
+                    norm_of_perpendicular_force[0]
+                )
+            )
         tangential_forces = np.empty(world.size)
         world.Allgather(
                 sendbuf=[my_tangential_force, MPI.DOUBLE],
@@ -415,26 +410,30 @@ def main():
         )
         perpendicular_forces = perpendicular_forces[group_roots]
 
-        # Compute total length of string
+        # Compute string length and parameterization
+        if (replica == first_replica):
+            norm_of_chunk_distance_left = 0.0
+        elif (replica == last_replica) or (not energy_decreases_monotonously):
+            chunk_distance_left, norm_of_chunk_distance_left = calc_chunk_distance(
+                    chunk_of_my_dof, chunk_of_left_dof, group)
+        else:
+            chunk_distance_left = chunk_distance
+            norm_of_chunk_distance_left = norm_of_chunk_distance
         # Here, we would weight by energy. The factor 1.0 is a placeholder.
-        if (replica > 0 and group.rank == 0):
-            length_increment = 1.0 * distance_to_left
-        distance_to_left = np.asarray(distance_to_left)
-        world.Barrier()
-
-        # Determine the positions of the replicas on the string
+        if (replica > first_replica and group.rank == 0):
+            length_increment = 1.0 * norm_of_chunk_distance_left
+        norm_of_chunk_distance_left = np.asarray(norm_of_chunk_distance_left)
         parameterization = np.empty(world.size)
         world.Allgather(
-                sendbuf=[distance_to_left, MPI.DOUBLE],
+                sendbuf=[norm_of_chunk_distance_left, MPI.DOUBLE],
                 recvbuf=[parameterization, MPI.DOUBLE]
-        )
+        ) # Implicit world.Barrier()
         parameterization = parameterization[group_roots]
         parameterization = np.cumsum(parameterization, out=parameterization)
         length = parameterization[-1]
         parameterization /= length
-        # Calculate ideal replica positions.
-        # If the current positions are energy-weighted, then then target
-        # positions must be weighted, too.
+        # If the current parameterization is energy-weighted, then then target
+        # parameterization must be energy-weighted, too.
         my_target_parameter = np.array(float(replica + 1) / float(num_replicas))
         target_parameterization = np.empty(world.size)
         world.Allgather(
@@ -491,7 +490,7 @@ def main():
                 x = ((target_parameterization[dest] - parameterization[replica - 1])
                     /(parameterization[replica] - parameterization[replica - 1])
                 )
-                y_chunk = (chunk_of_left_dof + x * chunk_dist_left)
+                y_chunk = (chunk_of_left_dof + x * chunk_distance_left)
                 if dest == replica:
                     group.Gatherv(
                         [y_chunk, dof_chunk_sizes[group.rank], MPI.DOUBLE],
@@ -595,12 +594,9 @@ def main():
 
     world.Barrier()
     # Write output data
-    my_lammps.command(
-            'dump 1 all custom 1'
-            + ' dump.replica_{:d} id type x y z c_PE_atom'.format(replica))
-    my_lammps.command('dump_modify 1 pad 6'
-            + ' format "%.7d %d %22.14e %22.14e %22.14e %22.14e"')
-    my_lammps.command('run 0 post no')
+    my_lammps.command(minimize_command)
+    my_lammps.command("velocity all set 0.0 0.0 0.0")
+    my_lammps.command('write_data data.out.{:d}'.format(replica))
     my_lammps.close()
 
 def calc_chunk_distance(chunk1, chunk2, comm):
