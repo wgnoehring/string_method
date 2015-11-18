@@ -263,15 +263,15 @@ def main():
     )
     if has_timer:
         timer = Timer()
+        timer.stamp()
+
     for iteration in range(max_string_iterations):
-        if has_timer:
-            timer.stamp()
         # Evolve replica
         my_lammps.command(minimize_command)
         my_lammps.command("velocity all set 0.0 0.0 0.0")
         # Extract coordinates and energy
         # Note: - all processes in the group have the same view
-        #       - np.asarray from ctypes does not copy, ideally
+        #       - np.asarray from ctypes does not copy if possible
         #       - these arrays are not masked
         my_dof = np.asarray(my_lammps.gather_atoms("x", 1, 3))
         my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
@@ -314,7 +314,8 @@ def main():
         if has_timer:
             timer.stamp()
             logfile.write(
-                'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
+                'Time for Lammps call and pbc application:\t'
+                + str(timer.elapsed_time) + '\n'
             )
 
         # Get coordinates of left and right neighbor
@@ -451,7 +452,8 @@ def main():
         if has_timer:
             timer.stamp()
             logfile.write(
-                'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
+                'Time for tangent calculation and force projection:\t'
+                + str(timer.elapsed_time) + '\n'
             )
 
         # Determine which replica is associated with the interval
@@ -508,7 +510,7 @@ def main():
         if has_timer:
             timer.stamp()
             logfile.write(
-                'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
+                'Time for interpolation:\t' + str(timer.elapsed_time) + '\n'
             )
 
         # Communicate interpolated values to the replicas which will use them
@@ -565,36 +567,45 @@ def main():
             converged = True
             if group.rank == 0:
                 logfile.write('Converged\n')
-        my_dof_old = np.copy(my_dof)
-
-        # Re-apply  periodic   boundary  conditions   Note:  we   re-apply  the
-        # conditions according to the  initial state, before the interpolation.
-        # If an atom has moved out of the box during interpolation, this should
-        # not be  a problem, because we  perform only 1-step runs  with pre=yes
-        # (default), so  pbcs are re-applied.  It might  even be valid  to skip
-        # this step.
-        chunk_of_my_dof = apply_pbc(
-            chunk_of_my_dof, periodic_boundary, image_distances, 'wrap'
-        )
-        group.Allgatherv(
-            sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-            recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE]
-        )
-        my_lammps.scatter_atoms(
-            "x", 1, 3, np.ctypeslib.as_ctypes(my_dof)
-        )
         if world.rank == 0:
             save_reaction_path(
                 iteration, length, parameterization, energies, displacements,
                 tangential_forces, perpendicular_forces
             )
+        if not converged:
+            my_dof_old = np.copy(my_dof)
+            # Re-apply   periodic  boundary   conditions   Note:  we   re-apply
+            # the  conditions  according  to  the  initial  state,  before  the
+            # interpolation.  If  an atom  has  moved  out  of the  box  during
+            # interpolation, this should  not be a problem,  because we perform
+            # only 1-step runs with pre=yes  (default), so pbcs are re-applied.
+            # It might even be valid to skip this step.
+            chunk_of_my_dof = apply_pbc(
+                chunk_of_my_dof, periodic_boundary, image_distances, 'wrap'
+            )
+            group.Allgatherv(
+                sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+                recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE]
+            )
+            # Do not use interpolated values if calculation has converged. This
+            # is a  small tradeoff:  the parameterization  is not  exactly, the
+            # target parameterization,  but interpolation  error is  avoided in
+            # the final structure.
+            my_lammps.scatter_atoms(
+                "x", 1, 3, np.ctypeslib.as_ctypes(my_dof)
+            )
         world.Barrier()
-        if converged: break
+        if has_timer:
+            timer.stamp()
+            logfile.write(
+                'Time for sharing interpolated data, displacement calculation'
+                + ' and pbc application:\t' + str(timer.elapsed_time) + '\n'
+            )
+        if converged:
+            break
+        # End of iteration ----------------------------------------------------
 
     world.Barrier()
-    # Write output data
-    my_lammps.command(minimize_command)
-    my_lammps.command("velocity all set 0.0 0.0 0.0")
     my_lammps.command('write_data data.out.{:d}'.format(replica))
     my_lammps.close()
 
