@@ -218,11 +218,10 @@ def main():
     chunk_of_my_dof.mask = chunk_of_dof_mask
     chunk_of_my_dof_old = ma.empty(dof_chunk_sizes[group.rank])
     chunk_of_my_dof_old.mask = chunk_of_dof_mask
-    if replica > 0:
-        chunk_of_left_dof = ma.empty(dof_chunk_sizes[group.rank])
-        chunk_of_left_dof.mask = chunk_of_dof_mask
-        chunk_of_right_dof = ma.empty(dof_chunk_sizes[group.rank])
-        chunk_of_right_dof.mask = chunk_of_dof_mask
+    chunk_of_left_dof = ma.empty(dof_chunk_sizes[group.rank])
+    chunk_of_left_dof.mask = chunk_of_dof_mask
+    chunk_of_right_dof = ma.empty(dof_chunk_sizes[group.rank])
+    chunk_of_right_dof.mask = chunk_of_dof_mask
     chunk_of_tangent = ma.empty(dof_chunk_sizes[group.rank])
     chunk_of_tangent.mask = chunk_of_dof_mask
     chunk_of_my_force = ma.empty(dof_chunk_sizes[group.rank])
