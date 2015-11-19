@@ -1,71 +1,70 @@
 #!/bin/env python
 """Calculate a transition path with the modified string method.
 
-Synopsis:
-    This  is a  prototype implementation  of  the modified  string method,  see
-    Weinan et al. The Journal of Chemical Physics 126, 164103 2007.
+This is a prototype implementation of the modified string method, see Weinan et
+al. The Journal of Chemical Physics 126, 164103 2007.
 
-    The general workflow is as follows: First, MPI communicators are set up and
-    a number of num_replicas Lammps instances are created and initialized. Note
-    that  more than  one  CPU  can be  associated  with  each Lammps  instance,
-    i.e.  it is  possible  to parallelize  on the  replica  level. Second,  the
-    transition path is calculated iteratively. The maximum number of iterations
-    is  max_string_iterations.  As  the  first  step  in  each  iteration,  the
-    equations of motion are integrated with Lammps (using num_lammps_iterations
-    sub-iterations). After integration, the  atomic positions are extracted and
-    the string is reparameterized using linear interpolation.
+The general  workflow is as  follows: First, MPI  communicators are set  up and
+a  number  of  num_replicas  Lammps  instances  are  created  and  initialized.
+Note  that more  than one  CPU  can be  associated with  each Lammps  instance,
+i.e.  it  is  possible  to  parallelize  on  the  replica  level.  Second,  the
+transition path is calculated iteratively.  The maximum number of iterations is
+max_string_iterations. As  the first step  in each iteration, the  equations of
+motion are integrated with Lammps (using num_lammps_iterations sub-iterations).
+After  integration,  the atomic  positions  are  extracted  and the  string  is
+reparameterized using linear interpolation.
 
-    Note that in the time splitting scheme  proposed in the paper of Weinan and
-    coworkers,  the  string  would  be reparameterized  after  every  timestep.
-    However, this  would be computationally  too expensive. Further,  note that
-    waiting  for num_lammps_timesteps  between reparameterizations  will reduce
-    the  accuracy of  the calculation,  because  replicas will  slide down  the
-    transition path.
+Note that  in the  time splitting scheme  proposed in the  paper of  Weinan and
+coworkers, the string  would be reparameterized after  every timestep. However,
+this would  be computationally  too expensive. Further,  note that  waiting for
+num_lammps_timesteps between  reparameterizations will  reduce the  accuracy of
+the calculation, because replicas will slide down the transition path.
 
-Usage:
+Example:
     srun rope.py config_file
 
 Args:
     config_file: Parameters for the  string method calculation, stored in  the
         format  of  python-configparser, see below.
 
-Configuration file:
-    The configuration file contains two sections, [setup] and [run].
-    This example shows the parameters, their types and their meaning:
-    [setup]
-    # Lammps setup file (str)
-    setup_file = in.lammps.string
-    # Number of replicas (int)
-    num_replicas = 16
-    # Number of atoms (int)
-    num_atoms = 311040
-    # Atom types with fixed degrees of freedom (sequence of int)
-    fixed_types = 3 4
-    # X, Y, Z periodicity (three int, 0  = non-periodic boundary / 1 = periodic
-    # boundary). Note:  in case of parallelepiped-shaped  simulations, only the
-    # orthogonal face can be periodic at the moment.
-    periodic_boundary = 0 0 1
-    [run]
-    # Number of Lammps iterations between reparameterizations (int)
-    num_lammps_iterations = 100
-    # Maximum number of reparameterizations (int)
-    max_string_iterations = 400
-    # Stop criterion (float)
-    string_displacement_threshold = 1.0e-3
-    # Measure run time? (bool)
-    measure_time = True
+    Configuration file:
+        The configuration file contains two sections, [setup] and [run].
+        This example shows the parameters, their types and their meaning:
+        [setup]
+        # Lammps setup file (str)
+        setup_file = in.lammps.string
+        # Number of replicas (int)
+        num_replicas = 16
+        # Number of atoms (int)
+        num_atoms = 311040
+        # Atom types with fixed degrees of freedom (sequence of int)
+        fixed_types = 3 4
+        # X,  Y,  Z  periodicity  (three  int,  0  =  non-periodic  boundary  /
+        # 1  =  periodic  boundary).  Note: in  case  of  parallelepiped-shaped
+        # simulations, only the orthogonal face can be periodic at the moment.
+        periodic_boundary = 0 0 1
+        [run]
+        # Number of Lammps iterations between reparameterizations (int)
+        num_lammps_iterations = 100
+        # Maximum number of reparameterizations (int)
+        max_string_iterations = 400
+        # Stop criterion (float)
+        string_displacement_threshold = 1.0e-3
+        # Measure run time? (bool)
+        measure_time = True
 
-Lammps setup file:
-    The  Lammps  calculation  is  initialized  by  executing  the  commands  in
-    setup_file. Where needed, the number of the current replica can be inserted
-    using the  placeholder '?c'. E.g.  "data.?c" becomes data.0 for  replica 0,
-    data.1 for replica  1, etc. Using this templating  mechanism and read_data,
-    the  appropriate coordinates  can be  loaded by  each replica.  It is  very
-    important that  the image  flags are  consistent between  replicas, because
-    reparameterization requires 'unwrapping' of atom coordinates that have been
-    'wrapped' around periodic boundaries. Finally, an equal-style variable 'PE'
-    must be  defined in  setup_file. This variable  must compute  the potential
-    energy of all atoms that are moved in the string method calculation.
+    setup_file:
+        The  Lammps calculation  is initialized  by executing  the commands  in
+        setup_file.  Where needed,  the number  of the  current replica  can be
+        inserted using the placeholder '?c'.  E.g. "data.?c" becomes data.0 for
+        replica 0, data.1  for replica 1, etc. Using  this templating mechanism
+        and  read_data,  the appropriate  coordinates  can  be loaded  by  each
+        replica.  It is  very important  that  the image  flags are  consistent
+        between replicas,  because reparameterization requires  'unwrapping' of
+        atom coordinates  that have been 'wrapped'  around periodic boundaries.
+        Finally, an  equal-style variable 'PE'  must be defined  in setup_file.
+        This variable must  compute the potential energy of all  atoms that are
+        moved in the string method calculation.
 
 Requirements:
     - mpi4py version 1.3.1 or more recent (implies version 0.2.2.+  of ctypes)
