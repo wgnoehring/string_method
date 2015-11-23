@@ -483,6 +483,8 @@ def main():
         # Determine which replica is associated with the interval
         # in which the new position lies and request interpolation
         bins = np.searchsorted(parameterization, target_parameterization, 'left')
+        bins[0]  = 1
+        bins[-1] = num_replicas - 1
         my_dest = np.where(bins == replica)[0]
         my_dest = [i for i in my_dest if not i in [0, num_replicas - 1]]
         my_source = bins[replica]
@@ -789,13 +791,7 @@ def main():
     parameterization /= length
     # If the current parameterization is energy-weighted, then then target
     # parameterization must be energy-weighted, too.
-    my_target_parameter = np.array(float(replica + 1) / float(num_replicas))
-    target_parameterization = np.empty(world.size)
-    world.Allgather(
-            sendbuf=[np.array(my_target_parameter), MPI.DOUBLE],
-            recvbuf=[target_parameterization, MPI.DOUBLE]
-    )
-    target_parameterization = target_parameterization[group_roots]
+    target_parameterization = np.linspace(0.0, 1.0, num_replicas, endpoint=True)
     if group.rank == 0:
         logfile.write(
             'Parameterization:\t' + list_to_str(parameterization) + '\n'
