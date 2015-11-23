@@ -289,15 +289,15 @@ def main():
     )
     if has_timer:
         timer = Timer()
+        timer.stamp()
+
     for iteration in range(max_string_iterations):
-        if has_timer:
-            timer.stamp()
         # Evolve replica
         my_lammps.command(minimize_command)
         my_lammps.command("velocity all set 0.0 0.0 0.0")
         # Extract coordinates and energy
         # Note: - all processes in the group have the same view
-        #       - np.asarray from ctypes does not copy, ideally
+        #       - np.asarray from ctypes does not copy if possible
         #       - these arrays are not masked
         my_dof = np.asarray(my_lammps.gather_atoms("x", 1, 3))
         my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
@@ -340,7 +340,8 @@ def main():
         if has_timer:
             timer.stamp()
             logfile.write(
-                'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
+                'Time for Lammps call and pbc application:\t'
+                + str(timer.elapsed_time) + '\n'
             )
 
         # Get coordinates of left and right neighbor
@@ -459,13 +460,7 @@ def main():
         parameterization /= length
         # If the current parameterization is energy-weighted, then then target
         # parameterization must be energy-weighted, too.
-        my_target_parameter = np.array(float(replica + 1) / float(num_replicas))
-        target_parameterization = np.empty(world.size)
-        world.Allgather(
-                sendbuf=[np.array(my_target_parameter), MPI.DOUBLE],
-                recvbuf=[target_parameterization, MPI.DOUBLE]
-        )
-        target_parameterization = target_parameterization[group_roots]
+        target_parameterization = np.linspace(0.0, 1.0, num_replicas, endpoint=True)
         if group.rank == 0:
             logfile.write(
                 'Parameterization:\t' + list_to_str(parameterization) + '\n'
@@ -477,7 +472,8 @@ def main():
         if has_timer:
             timer.stamp()
             logfile.write(
-                'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
+                'Time for tangent calculation and force projection:\t'
+                + str(timer.elapsed_time) + '\n'
             )
 
         # Determine which replica is associated with the interval
@@ -536,7 +532,7 @@ def main():
         if has_timer:
             timer.stamp()
             logfile.write(
-                'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
+                'Time for interpolation:\t' + str(timer.elapsed_time) + '\n'
             )
 
         # Communicate interpolated values to the replicas which will use them
@@ -593,218 +589,45 @@ def main():
             converged = True
             if group.rank == 0:
                 logfile.write('Converged\n')
-        my_dof_old = np.copy(my_dof)
-
-        # Re-apply  periodic   boundary  conditions   Note:  we   re-apply  the
-        # conditions according to the  initial state, before the interpolation.
-        # If an atom has moved out of the box during interpolation, this should
-        # not be  a problem, because we  perform only 1-step runs  with pre=yes
-        # (default), so  pbcs are re-applied.  It might  even be valid  to skip
-        # this step.
-        chunk_of_my_dof = apply_pbc(
-            chunk_of_my_dof, periodic_boundary, image_distances, 'wrap'
-        )
-        group.Allgatherv(
-            sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-            recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE]
-        )
-        my_lammps.scatter_atoms(
-            "x", 1, 3, np.ctypeslib.as_ctypes(my_dof)
-        )
         if world.rank == 0:
             save_reaction_path(
                 iteration, length, parameterization, energies, displacements,
                 tangential_forces, perpendicular_forces
             )
+        if not converged:
+            my_dof_old = np.copy(my_dof)
+            # Re-apply   periodic  boundary   conditions   Note:  we   re-apply
+            # the  conditions  according  to  the  initial  state,  before  the
+            # interpolation.  If  an atom  has  moved  out  of the  box  during
+            # interpolation, this should  not be a problem,  because we perform
+            # only 1-step runs with pre=yes  (default), so pbcs are re-applied.
+            # It might even be valid to skip this step.
+            chunk_of_my_dof = apply_pbc(
+                chunk_of_my_dof, periodic_boundary, image_distances, 'wrap'
+            )
+            group.Allgatherv(
+                sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+                recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE]
+            )
+            # Do not use interpolated values if calculation has converged. This
+            # is a  small tradeoff:  the parameterization  is not  exactly, the
+            # target parameterization,  but interpolation  error is  avoided in
+            # the final structure.
+            my_lammps.scatter_atoms(
+                "x", 1, 3, np.ctypeslib.as_ctypes(my_dof)
+            )
         world.Barrier()
-        if converged: break
+        if has_timer:
+            timer.stamp()
+            logfile.write(
+                'Time for sharing interpolated data, displacement calculation'
+                + ' and pbc application:\t' + str(timer.elapsed_time) + '\n'
+            )
+        if converged:
+            break
+        # End of iteration ----------------------------------------------------
 
     world.Barrier()
-    # Write output data
-    # Todo: pack the (duplicate) code below into function calls
-    if has_timer:
-        timer.stamp()
-    # Evolve replica
-    my_lammps.command(minimize_command)
-    my_lammps.command("velocity all set 0.0 0.0 0.0")
-    # Extract coordinates and energy
-    # Note: - all processes in the group have the same view
-    #       - np.asarray from ctypes does not copy, ideally
-    #       - these arrays are not masked
-    my_dof = np.asarray(my_lammps.gather_atoms("x", 1, 3))
-    my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
-    my_force = np.asarray(my_lammps.gather_atoms("f", 1, 3))
-    my_energy = np.asarray(my_lammps.extract_variable("PE", "all", 0))
-    # Unwrap atom positions
-    group.Scatterv(
-        [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-        chunk_of_my_dof, root=0
-    )
-    group.Scatterv(
-        [my_image_flags, img_chunk_sizes, img_chunk_displ, MPI.INT],
-        img_chunk, root=0
-    )
-    image_distances = calc_image_distances(
-        img_chunk, periodic_boundary, box_size
-    )
-    chunk_of_my_dof = apply_pbc(
-        chunk_of_my_dof, periodic_boundary, image_distances, 'unwrap'
-    )
-    # Note: after Gatherv, my_dof is inconsistent in the group
-    # This incosistency will be eliminated when the group root
-    # receives the interpolated vector and scatters to chunks.
-    group.Gatherv(
-        sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-        recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-        root=0
-    )
-    energies = np.empty(world.size)
-    world.Allgather(
-            sendbuf=[my_energy, MPI.DOUBLE],
-            recvbuf=[energies, MPI.DOUBLE]
-    ) # Implicit world.Barrier
-    energies = energies[group_roots]
-    left_energy = np.roll(energies, +1)[replica]
-    my_energy = energies[replica]
-    right_energy = np.roll(energies, -1)[replica]
-    if group.rank == 0:
-        logfile.write('Minimized energy and applied pbc\n')
-    if has_timer:
-        timer.stamp()
-        logfile.write(
-            'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
-        )
-
-    # Get coordinates of left and right neighbor
-    if (group.rank == 0):
-        world.Sendrecv(
-            sendbuf=[my_dof, MPI.DOUBLE], dest=right_root,
-            recvbuf=[left_dof, MPI.DOUBLE], source=left_root
-        )
-        world.Sendrecv(
-            sendbuf=[my_dof, MPI.DOUBLE], dest=left_root,
-            recvbuf=[right_dof, MPI.DOUBLE], source=right_root
-        )
-    if  (replica > first_replica):
-        group.Scatterv(
-            sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            recvbuf=chunk_of_left_dof,
-            root=0
-        )
-    if (replica < last_replica):
-        group.Scatterv(
-            sendbuf=[right_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            recvbuf=chunk_of_right_dof,
-            root=0
-        )
-
-    # Compute 'improved' estimate of tangent vector, see
-    # Henkelman, Jonsson, JChemPhys 2000, 113 (22), 9978.
-    energy_increases_monotonously = (left_energy < my_energy < right_energy)
-    energy_decreases_monotonously = (left_energy > my_energy > right_energy)
-    if group.rank == 0:
-        logfile.write(
-            'Tangent computation. Energies:\t'
-            +'{:.3f}\t{:.3f}\t{:.3f}\n'.format(
-                left_energy, my_energy, right_energy
-            )
-        )
-    if (replica == first_replica) or energy_increases_monotonously:
-        if group.rank == 0:
-            logfile.write('Forward difference\n')
-        chunk1 = chunk_of_right_dof
-        chunk2 = chunk_of_my_dof
-    elif (replica == last_replica) or energy_decreases_monotonously:
-        if group.rank == 0:
-            logfile.write('Backward difference\n')
-        chunk1 = chunk_of_my_dof
-        chunk2 = chunk_of_left_dof
-    else:
-        if group.rank == 0:
-            logfile.write('Central difference\n')
-        chunk1 = chunk_of_right_dof
-        chunk2 = chunk_of_left_dof
-    chunk_distance, norm_of_total_distance = calc_chunk_distance(
-            chunk1, chunk2, group
-    )
-    chunk_of_tangent = chunk_distance / norm_of_total_distance
-
-    # Compute tangential and perpendicular force
-    group.Scatterv(
-        [my_force, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-        chunk_of_my_force, root=0)
-    chunk_projection = ma.dot(
-            ma.ravel(chunk_of_my_force),
-            ma.ravel(chunk_of_tangent)
-    )
-    my_tangential_force = np.empty(1)
-    group.Allreduce(
-        [chunk_projection, MPI.DOUBLE],
-        [my_tangential_force, MPI.DOUBLE], op=MPI.SUM)
-    chunk_of_perpendicular_force, norm_of_perpendicular_force = calc_chunk_distance(
-            chunk_of_my_force, my_tangential_force * chunk_of_tangent, group)
-    if group.rank == 0:
-        logfile.write(
-            'Projection of force on tangent:\t{:.4e}\n'.format(
-                my_tangential_force[0]
-            )
-        )
-        logfile.write(
-            'Norm of perpendicular force:\t{:.4e}\n'.format(
-                norm_of_perpendicular_force[0]
-            )
-        )
-    tangential_forces = np.empty(world.size)
-    world.Allgather(
-            sendbuf=[my_tangential_force, MPI.DOUBLE],
-            recvbuf=[tangential_forces, MPI.DOUBLE]
-    )
-    tangential_forces = tangential_forces[group_roots]
-    perpendicular_forces = np.empty(world.size)
-    world.Allgather(
-            sendbuf=[norm_of_perpendicular_force, MPI.DOUBLE],
-            recvbuf=[perpendicular_forces, MPI.DOUBLE]
-    )
-    perpendicular_forces = perpendicular_forces[group_roots]
-
-    # Compute string length and parameterization
-    if (replica == first_replica):
-        norm_of_total_distance_left = 0.0
-    elif (replica == last_replica) or (not energy_decreases_monotonously):
-        chunk_distance_left, norm_of_total_distance_left = calc_chunk_distance(
-                chunk_of_my_dof, chunk_of_left_dof, group)
-    else:
-        chunk_distance_left = chunk_distance
-        norm_of_total_distance_left = norm_of_total_distance
-    # Here, we would weight by energy. The factor 1.0 is a placeholder.
-    if (replica > first_replica and group.rank == 0):
-        length_increment = 1.0 * norm_of_total_distance_left
-    norm_of_total_distance_left = np.asarray(norm_of_total_distance_left)
-    parameterization = np.empty(world.size)
-    world.Allgather(
-            sendbuf=[norm_of_total_distance_left, MPI.DOUBLE],
-            recvbuf=[parameterization, MPI.DOUBLE]
-    ) # Implicit world.Barrier()
-    parameterization = parameterization[group_roots]
-    parameterization = np.cumsum(parameterization, out=parameterization)
-    length = parameterization[-1]
-    parameterization /= length
-    # If the current parameterization is energy-weighted, then then target
-    # parameterization must be energy-weighted, too.
-    target_parameterization = np.linspace(0.0, 1.0, num_replicas, endpoint=True)
-    if group.rank == 0:
-        logfile.write(
-            'Parameterization:\t' + list_to_str(parameterization) + '\n'
-        )
-        logfile.write(
-            'Target parameterization:\t'
-            + list_to_str(target_parameterization) + '\n'
-        )
-    if has_timer:
-        timer.stamp()
-        logfile.write(
-            'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
-        )
     my_lammps.command('write_data data.out.{:d}'.format(replica))
     my_lammps.close()
 
