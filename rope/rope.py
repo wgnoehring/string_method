@@ -110,6 +110,12 @@ def main():
     string_displacement_threshold = config.getfloat('run', 'string_displacement_threshold')
     measure_time = config.getboolean('run', 'measure_time')
 
+    # Assert that masked arrays stay masked arrays
+    # and save masked degrees of freedom per partition to disk
+    check_masks = False
+    # Calculate parameterization before Lammps call and after interpolation
+    check_interpolation = True
+
     # Split communicator into groups. Each group will simulate one replica.
     world = MPI.COMM_WORLD
     if world.size < num_replicas - 1:
@@ -266,7 +272,7 @@ def main():
             dof_chunk_bounds[group.rank][0]:dof_chunk_bounds[group.rank][1]
     ]
     fixed_dofs = np.where(dof_mask)[0]
-    dof_mask_size = fixed_dofs.size 
+    dof_mask_size = fixed_dofs.size
     if group.rank == 0:
         logfile.write('Total number of masked DOFs:\t{:d}\n'.format(dof_mask_size))
         for i in range(group.size):
@@ -275,7 +281,7 @@ def main():
             tmp_chunk = dof_mask[mask_start:mask_end]
             logfile.write('Number of masked values in chunk {:d}:\t{:d}\n'.format(
                 i, np.where(tmp_chunk)[0].size
-                ) 
+                )
             )
             del(tmp_chunk)
             del(mask_start)
@@ -300,16 +306,13 @@ def main():
     if group.rank == 0:
         logfile.write('Masked chunks\n')
 
-    # Assert that masked arrays stay masked arrays
-    # and save masked degrees of freedom per partition to disk
-    check_masks = True
-
     # Initialize old coordinates and unwrap
     my_dof_old = np.asarray(my_lammps.gather_atoms("x", 1, 3))
     my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
     group.Scatterv(
-        [my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-        chunk_of_my_dof, root=0
+        sendbuf=[my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+        recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+        root=0
     )
     if check_masks:
         chunk_of_masked_dof = ma.copy(chunk_of_my_dof)
@@ -318,20 +321,21 @@ def main():
         chunk_of_masked_dof = chunk_of_masked_dof.reshape(
             (chunk_of_masked_dof.size / 3, 3))
         np.savetxt(
-            'repl_{:d}_part_{:d}'.format(replica, group.rank), 
+            'repl_{:d}_part_{:d}'.format(replica, group.rank),
             chunk_of_masked_dof
         )
         world.Barrier()
     if check_masks: check_mask(chunk_of_my_dof)
     group.Scatterv(
-        [my_image_flags, img_chunk_sizes, img_chunk_displ, MPI.INT],
-        img_chunk, root=0
+        sendbuf=[my_image_flags, img_chunk_sizes, img_chunk_displ, MPI.INT],
+        recvbuf=[img_chunk, img_chunk_sizes[group.rank], MPI.INT],
+        root=0
     )
     if check_masks: check_mask(img_chunk)
     image_distances = calc_image_distances(
         img_chunk, periodic_boundary, box_size
     )
-    if check_masks: 
+    if check_masks:
         for list_element in image_distances:
             if list_element is not None:
                 check_mask(list_element)
@@ -347,8 +351,9 @@ def main():
         root=0
     )
     group.Scatterv(
-        [my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-        chunk_of_my_dof, root=0
+        sendbuf=[my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+        recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+        root=0
     )
     if group.rank == 0:
         logfile.write('Initialized old coordinates\n')
@@ -360,102 +365,104 @@ def main():
     )
     if group.rank == 0:
         logfile.write('\nSTARTING ITERATION\n\n')
-        logfile.flush() 
+        logfile.flush()
     if has_timer:
         timer = Timer()
         timer.stamp()
 
     for iteration in range(max_string_iterations):
-        if group.rank == 0: 
+        if group.rank == 0:
             msg = 'Iteration {:d} '.format(iteration)
             logfile.write(msg + '-' * max(0, (72-len(msg))) + '\n')
-        # Begin of interpolation check [pre] ----------------------------------
-        # Pass coordinates back to Lammps, do a 0 step recalculate parameterization
-        my_lammps.command('run 0')
-        my_dof = np.asarray(my_lammps.gather_atoms("x", 1, 3))
-        my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
-        group.Scatterv(
-            [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            chunk_of_my_dof, root=0
-        )
-        if check_masks: check_mask(chunk_of_my_dof)
-        group.Scatterv(
-            [my_image_flags, img_chunk_sizes, img_chunk_displ, MPI.INT],
-            img_chunk, root=0
-        )
-        if check_masks: check_mask(img_chunk)
-        image_distances = calc_image_distances(
-            img_chunk, periodic_boundary, box_size
-        )
-        if check_masks: 
-            for list_element in image_distances:
-                if list_element is not None:
-                    check_mask(list_element)
-        chunk_of_my_dof = apply_pbc(
-            chunk_of_my_dof, periodic_boundary, image_distances, 'unwrap'
-        )
-        if check_masks: check_mask(chunk_of_my_dof)
-        group.Gatherv(
-            sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-            recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            root=0
-        )
-        group.Scatterv(
-            sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-            root=0
-        )
-        world.Barrier()
-        if (group.rank == 0):
-            world.Sendrecv(
-                sendbuf=[my_dof, MPI.DOUBLE], dest=right_root,
-                recvbuf=[left_dof, MPI.DOUBLE], source=left_root
-            )
-        world.Barrier()
-        if  (replica > first_replica):
+        if check_interpolation:
+            # Begin of interpolation check [pre] ------------------------------
+            my_lammps.command('run 0')
+            my_dof = np.asarray(my_lammps.gather_atoms("x", 1, 3))
+            my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
             group.Scatterv(
-                sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                recvbuf=chunk_of_left_dof,
+                sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
                 root=0
             )
-            if check_masks: check_mask(chunk_of_left_dof)
-        # Compute string length and parameterization
-        if (replica == first_replica):
-            norm_of_total_distance_left = 0.0
-        else:
-            chunk_distance_left, norm_of_total_distance_left = calc_chunk_distance(
-                    chunk_of_my_dof, chunk_of_left_dof, group)
-            if check_masks: check_mask(chunk_distance_left)
-        norm_of_total_distance_left = np.asarray(norm_of_total_distance_left)
-        parameterization = np.empty(world.size)
-        world.Allgather(
-                sendbuf=[norm_of_total_distance_left, MPI.DOUBLE],
-                recvbuf=[parameterization, MPI.DOUBLE]
-        ) # Implicit world.Barrier()
-        world.Barrier()
-        if iteration == 0: 
-            mode = 'w'
-        else:
-            mode = 'a'
-        with open('param_view.{:d}'.format(world.rank), mode) as file:
-            file.write(list_to_str(parameterization) + '\n')
-        parameterization = parameterization[group_roots]
-        parameterization = np.cumsum(parameterization, out=parameterization)
-        length = parameterization[-1]
-        parameterization /= length
-        if group.rank == 0:
-            logfile.write(
-                'String length (interpolation check [pre]):\t{:.3e}'.format(length) + '\n'
+            if check_masks: check_mask(chunk_of_my_dof)
+            group.Scatterv(
+                sendbuf=[my_image_flags, img_chunk_sizes, img_chunk_displ, MPI.INT],
+                recvbuf=[img_chunk, img_chunk_sizes[group.rank], MPI.INT],
+                root=0
             )
-            logfile.write(
-                'Parameterization (interpolation check [pre]):\t' + list_to_str(parameterization) + '\n'
+            if check_masks: check_mask(img_chunk)
+            image_distances = calc_image_distances(
+                img_chunk, periodic_boundary, box_size
             )
-        if has_timer:
-            timer.stamp()
-            logfile.write(
-                'Time for interpolation check [pre]:\t'
-                + str(timer.elapsed_time) + '\n'
+            if check_masks:
+                for list_element in image_distances:
+                    if list_element is not None:
+                        check_mask(list_element)
+            chunk_of_my_dof = apply_pbc(
+                chunk_of_my_dof, periodic_boundary, image_distances, 'unwrap'
             )
+            if check_masks: check_mask(chunk_of_my_dof)
+            group.Gatherv(
+                sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+                recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                root=0
+            )
+            group.Scatterv(
+                sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+                root=0
+            )
+            world.Barrier()
+            if (group.rank == 0):
+                world.Sendrecv(
+                    sendbuf=[my_dof, MPI.DOUBLE], dest=right_root,
+                    recvbuf=[left_dof, MPI.DOUBLE], source=left_root
+                )
+            world.Barrier()
+            if  (replica > first_replica):
+                group.Scatterv(
+                    sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                    recvbuf=[chunk_of_left_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+                    root=0
+                )
+                if check_masks: check_mask(chunk_of_left_dof)
+            # Compute string length and parameterization
+            if (replica == first_replica):
+                norm_of_total_distance_left = 0.0
+            else:
+                chunk_distance_left, norm_of_total_distance_left = calc_chunk_distance(
+                        chunk_of_my_dof, chunk_of_left_dof, group)
+                if check_masks: check_mask(chunk_distance_left)
+            norm_of_total_distance_left = np.asarray(norm_of_total_distance_left)
+            parameterization = np.empty(world.size)
+            world.Allgather(
+                    sendbuf=[norm_of_total_distance_left, MPI.DOUBLE],
+                    recvbuf=[parameterization, MPI.DOUBLE]
+            ) # Implicit world.Barrier()
+            world.Barrier()
+            if iteration == 0:
+                mode = 'w'
+            else:
+                mode = 'a'
+            with open('param_view.{:d}'.format(world.rank), mode) as file:
+                file.write(list_to_str(parameterization) + '\n')
+            parameterization = parameterization[group_roots]
+            parameterization = np.cumsum(parameterization, out=parameterization)
+            length = parameterization[-1]
+            parameterization /= length
+            if group.rank == 0:
+                logfile.write(
+                    'String length (interpolation check [pre]):\t{:.3e}'.format(length) + '\n'
+                )
+                logfile.write(
+                    'Parameterization (interpolation check [pre]):\t' + list_to_str(parameterization) + '\n'
+                )
+            if has_timer:
+                timer.stamp()
+                logfile.write(
+                    'Time for interpolation check [pre]:\t'
+                    + str(timer.elapsed_time) + '\n'
+                )
         # End of interpolation check [pre] ------------------------------------
 
         # Evolve replica
@@ -478,19 +485,21 @@ def main():
         my_energy = np.asarray(my_lammps.extract_variable("PE", "all", 0))
         # Unwrap atom positions
         group.Scatterv(
-            [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            chunk_of_my_dof, root=0
+            sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+            recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+            root=0
         )
         if check_masks: check_mask(chunk_of_my_dof)
         group.Scatterv(
-            [my_image_flags, img_chunk_sizes, img_chunk_displ, MPI.INT],
-            img_chunk, root=0
+            sendbuf=[my_image_flags, img_chunk_sizes, img_chunk_displ, MPI.INT],
+            recvbuf=[img_chunk, img_chunk_sizes[group.rank], MPI.INT],
+            root=0
         )
         if check_masks: check_mask(img_chunk)
         image_distances = calc_image_distances(
             img_chunk, periodic_boundary, box_size
         )
-        if check_masks: 
+        if check_masks:
             for list_element in image_distances:
                 if list_element is not None:
                     check_mask(list_element)
@@ -542,14 +551,14 @@ def main():
         if  (replica > first_replica):
             group.Scatterv(
                 sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                recvbuf=chunk_of_left_dof,
+                recvbuf=[chunk_of_left_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
                 root=0
             )
             if check_masks: check_mask(chunk_of_left_dof)
         if (replica < last_replica):
             group.Scatterv(
                 sendbuf=[right_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                recvbuf=chunk_of_right_dof,
+                recvbuf=[chunk_of_right_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
                 root=0
             )
             if check_masks: check_mask(chunk_of_right_dof)
@@ -589,8 +598,10 @@ def main():
 
         # Compute tangential and perpendicular force
         group.Scatterv(
-            [my_force, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            chunk_of_my_force, root=0)
+            sendbuf=[my_force, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+            recvbuf=[chunk_of_my_force, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+            root=0
+            )
         if check_masks: check_mask(chunk_of_my_force)
         chunk_projection = ma.dot(
                 ma.ravel(chunk_of_my_force),
@@ -757,78 +768,86 @@ def main():
                 requests.append(my_request)
             re = MPI.Request.Waitall(requests)
 
-        ## Begin of interpolation check [post] ---------------------------------
-        group.Scatterv(
-            sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-            root=0
-        )
-        # Todo: remove Gatherv (unnecessary)
-        group.Gatherv(
-            sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-            recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            root=0
-        )
-        if check_masks: check_mask(chunk_of_my_dof)
-        world.Barrier()
-        if (group.rank == 0):
-            world.Sendrecv(
-                sendbuf=[my_dof, MPI.DOUBLE], dest=right_root,
-                recvbuf=[left_dof, MPI.DOUBLE], source=left_root
-            )
-        world.Barrier()
-        if  (replica > first_replica):
+
+        if check_interpolation:
+            ## Begin of interpolation check [post] ---------------------------------
             group.Scatterv(
-                sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                recvbuf=chunk_of_left_dof,
+                sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
                 root=0
             )
-            if check_masks: check_mask(chunk_of_left_dof)
-        # Compute string length and parameterization
-        if (replica == first_replica):
-            norm_of_total_distance_left = 0.0
-        else:
-            chunk_distance_left, norm_of_total_distance_left = calc_chunk_distance(
-                    chunk_of_my_dof, chunk_of_left_dof, group)
-            if check_masks: check_mask(chunk_distance_left)
-        norm_of_total_distance_left = np.asarray(norm_of_total_distance_left)
-        check_parameterization = np.empty(world.size)
-        world.Allgather(
-                sendbuf=[norm_of_total_distance_left, MPI.DOUBLE],
-                recvbuf=[check_parameterization, MPI.DOUBLE]
-        ) # Implicit world.Barrier()
-        world.Barrier()
-        check_parameterization = check_parameterization[group_roots]
-        check_parameterization = np.cumsum(check_parameterization, out=check_parameterization)
-        check_length = check_parameterization[-1]
-        check_parameterization /= check_length
-        if group.rank == 0:
-            logfile.write(
-                'String length (interpolation check [post]):\t{:.3e}'.format(check_length) + '\n'
+            # Todo: remove Gatherv (unnecessary)
+            group.Gatherv(
+                sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+                recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                root=0
             )
-            logfile.write(
-                'Parameterization (interpolation check [post]):\t' + list_to_str(check_parameterization) + '\n'
+            if check_masks: check_mask(chunk_of_my_dof)
+            world.Barrier()
+            if (group.rank == 0):
+                world.Sendrecv(
+                    sendbuf=[my_dof, MPI.DOUBLE], dest=right_root,
+                    recvbuf=[left_dof, MPI.DOUBLE], source=left_root
+                )
+            world.Barrier()
+            if  (replica > first_replica):
+                group.Scatterv(
+                    sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+                    recvbuf=[chunk_of_left_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
+                    root=0
+                )
+                if check_masks: check_mask(chunk_of_left_dof)
+            # Compute string length and parameterization
+            if (replica == first_replica):
+                norm_of_total_distance_left = 0.0
+            else:
+                chunk_distance_left, norm_of_total_distance_left = calc_chunk_distance(
+                        chunk_of_my_dof, chunk_of_left_dof, group)
+                if check_masks: check_mask(chunk_distance_left)
+            norm_of_total_distance_left = np.asarray(norm_of_total_distance_left)
+            check_parameterization = np.empty(world.size)
+            world.Allgather(
+                    sendbuf=[norm_of_total_distance_left, MPI.DOUBLE],
+                    recvbuf=[check_parameterization, MPI.DOUBLE]
+            ) # Implicit world.Barrier()
+            world.Barrier()
+            check_parameterization = check_parameterization[group_roots]
+            check_parameterization = np.cumsum(
+                    check_parameterization, out=check_parameterization
             )
-        if has_timer:
-            timer.stamp()
-            logfile.write(
-                'Time for interpolation check [post]:\t'
-                + str(timer.elapsed_time) + '\n'
-            )
-        # End of interpolation check [post] -----------------------------------
+            check_length = check_parameterization[-1]
+            check_parameterization /= check_length
+            if group.rank == 0:
+                logfile.write(
+                    'String length (interpolation check [post]):\t{:.3e}'.format(check_length) + '\n'
+                )
+                logfile.write(
+                    'Parameterization (interpolation check [post]):\t' + list_to_str(check_parameterization) + '\n'
+                )
+            if has_timer:
+                timer.stamp()
+                logfile.write(
+                    'Time for interpolation check [post]:\t'
+                    + str(timer.elapsed_time) + '\n'
+                )
+            # End of interpolation check [post] -----------------------------------
 
         # Reset coordinates  of atoms with  fixed dofs. This is  necessary even
         # though masked chunks have been used throughout because Gatherv copies
-        # values  (it  ignores  masks).  So  my_dof[fixed_dofs]  will
-        # contain whatever was in the corresponding chunks at these positions.
+        # values  (it  ignores  masks).  So  my_dof[fixed_dofs]  will contain
+        # whatever was in the corresponding chunks at these positions.
         my_dof[fixed_dofs] = my_dof_old[fixed_dofs] # Only group root holds current old dof
         group.Scatterv(
-            [my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            chunk_of_my_dof, root=0)
+            sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+            recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.root], MPI.DOUBLE],
+            root=0
+        )
         if check_masks: check_mask(chunk_of_my_dof)
         group.Scatterv(
-            [my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            chunk_of_my_dof_old, root=0)
+            sendbuf=[my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
+            recvbuf=[chunk_of_my_dof_old, dof_chunk_sizes[group.root], MPI.DOUBLE],
+            root=0
+        )
         if check_masks: check_mask(chunk_of_my_dof_old)
 
         # Compute displacement of this replica
@@ -890,7 +909,7 @@ def main():
                 + ' and pbc application:\t' + str(timer.elapsed_time) + '\n'
             )
         if group.rank == 0:
-            logfile.flush() 
+            logfile.flush()
         if converged:
             break
         # End of iteration ----------------------------------------------------
