@@ -839,13 +839,13 @@ def main():
         my_dof[fixed_dofs] = my_dof_old[fixed_dofs] # Only group root holds current old dof
         group.Scatterv(
             sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.root], MPI.DOUBLE],
+            recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
             root=0
         )
         if check_masks: check_mask(chunk_of_my_dof)
         group.Scatterv(
             sendbuf=[my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-            recvbuf=[chunk_of_my_dof_old, dof_chunk_sizes[group.root], MPI.DOUBLE],
+            recvbuf=[chunk_of_my_dof_old, dof_chunk_sizes[group.rank], MPI.DOUBLE],
             root=0
         )
         if check_masks: check_mask(chunk_of_my_dof_old)
