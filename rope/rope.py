@@ -371,7 +371,14 @@ def main():
         timer.stamp()
 
     for iteration in range(max_string_iterations):
-        user_requested_stop = int(os.path.exists('STOP_NOW'))
+        if world.rank == 0:
+            user_requested_stop = os.path.exists('STOP_NOW')
+            user_requested_stop = np.array((user_requested_stop, ), dtype=int)
+        else:
+            user_requested_stop = np.empty((1, ), dtype=int)
+        world.Bcast([user_requested_stop, 1, MPI.INT_INT], root=0)
+        user_requested_stop = user_requested_stop[0]
+
         if group.rank == 0:
             msg = 'Iteration {:d} '.format(iteration)
             logfile.write(msg + '-' * max(0, (72-len(msg))) + '\n')
