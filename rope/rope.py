@@ -21,8 +21,7 @@ num_lammps_timesteps between  reparameterizations will  reduce the  accuracy of
 the calculation, because replicas will slide down the transition path.
 
 The string  iteration can  be prematurely  stopped by  placing an  (empty) file
-'STOP_NOW' in  the current directory.  The script  checks for the  existence of
-this file at the end of the main loop.
+'STOP_NOW' in  the current directory.
 
 Example:
     srun rope.py config_file
@@ -90,6 +89,7 @@ import configparser
 import sys
 import ctypes
 import os
+import warnings
 
 def main():
     # Parse configuration file
@@ -314,6 +314,10 @@ def main():
     # Initialize old coordinates and unwrap
     my_dof_old = np.asarray(my_lammps.gather_atoms("x", 1, 3))
     my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
+    if group.rank == 0:
+        message = check_image_flags(my_image_flags)
+        if message is not None:
+            warnings.warn('\nReplica {:d}:'.format(replica) + message, stacklevel=2)
     group.Scatterv(
         sendbuf=[my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
         recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
@@ -918,6 +922,48 @@ def calc_chunk_distance(chunk1, chunk2, comm):
     distance_norm_of_comm = np.sqrt(distance_norm_of_comm)
     return (chunk_distance, distance_norm_of_comm)
 
+def check_image_flags(image_flags):
+    """Check whether image flags are -1, 0, or 1
+
+    Args:
+        image_flags (ndarray)
+    Returns:
+        message: None if flags are OK, str if flags are strange
+    """
+    # Bit mask values for decoding Lammps image flags:
+    imgmask = np.array(1023, dtype=image_flags.dtype)
+    imgmax = np.array(512, dtype=image_flags.dtype)
+    imgbits = np.array(10, dtype=image_flags.dtype)
+    img2bits = np.array(20, dtype=image_flags.dtype)
+    decoded_flags = np.zeros_like(image_flags)
+    decoded_flags = np.zeros((3, image_flags.size), dtype=image_flags.dtype)
+    decoded_flags[0, :]  = np.bitwise_and(image_flags, imgmask)
+    decoded_flags[0, :] -= imgmax
+    decoded_flags[1, :]  = np.right_shift(image_flags, imgbits)
+    decoded_flags[1, :] &= imgmask
+    decoded_flags[1, :] -= imgmax
+    decoded_flags[2, :]  = np.right_shift(image_flags, img2bits)
+    decoded_flags[2, :] -= imgmax
+    decoded_flags = decoded_flags.ravel()
+    strange_flags = np.logical_or.reduce([decoded_flags < -1, decoded_flags > 1])
+    if np.any(strange_flags):
+        num_strange_flags = (np.where(strange_flags)[0]).size
+        message = """
+{:d} image flags are smaller than -1 or larger than 1. This can occur if:
+    1) Atoms move long distances in your simulation.
+    2) Image flags are not consistent between replicas.
+    3) Lammps was not compiled with the LAMMPS_SMALLBIG typedef.
+You should stop the simulation if 1) can  be ruled out. You can do so by
+creating a  file 'STOP_NOW' in the  working directory. To solve  2) save
+the input replicas as data files and inspect the image flags. In case of
+3) the  image flags are not  decoded correctly. You will  either have to
+compile Lammps with  LAMMPS_SMALLBIG or change the  variables imgmax and
+img2bits in the string code.
+""".format(num_strange_flags)
+    else:
+        message = None
+    return message
+
 def calc_image_distances(img_chunk, periodic_boundary, box_size):
     """Calculate the lengths for wrapping or unwrapping atomic coordinates
     across periodic boundaries.
@@ -934,13 +980,14 @@ def calc_image_distances(img_chunk, periodic_boundary, box_size):
     Warning:
         - Triclinic boxes are not fully supported. In this case, only the
           non-inclinced direction can be periodic.
-        - imgmax = 512 and img2bits = 20 only if Lammps has been compiled
-          with LAMMPS_SMALLBIG
+        - imgmask = 1023, imgmax = 512, imgbits = 10 and img2bits = 20
+          only if Lammps was compiled with the LAMMPS_SMALLBIG typedef
     """
     # Bit mask values for decoding Lammps image flags:
-    imgmask = 1023
-    imgmax = 512
-    img2bits = 20
+    imgmask = np.array(1023, dtype=img_chunk.dtype)
+    imgmax = np.array(512, dtype=img_chunk.dtype)
+    imgbits = np.array(10, dtype=img_chunk.dtype)
+    img2bits = np.array(20, dtype=img_chunk.dtype)
     image_distances = [None] * 3
     if periodic_boundary[0]:
         image_distances[0]  = np.bitwise_and(img_chunk, imgmask)
@@ -948,7 +995,7 @@ def calc_image_distances(img_chunk, periodic_boundary, box_size):
         image_distances[0]  = image_distances[0].astype(float)
         image_distances[0] *= box_size[0]
     if periodic_boundary[1]:
-        image_distances[1]  = np.right_shift(img_chunk, img2bits)
+        image_distances[1]  = np.right_shift(img_chunk, imgbits)
         image_distances[1] &= imgmask
         image_distances[1] -= imgmax
         image_distances[1]  = image_distances[1].astype(float)
