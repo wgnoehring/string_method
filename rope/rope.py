@@ -68,16 +68,6 @@ Args:
         Finally, an  equal-style variable 'PE'  must be defined  in setup_file.
         This variable must  compute the potential energy of all  atoms that are
         moved in the string method calculation.
-
-Requirements:
-    - mpi4py version 1.3.1 or more recent (implies version 0.2.2.+  of ctypes)
-    - custom version of lammps.py
-
-Author:
-    Wolfram Georg Noehring
-    Tue Jul 14 22:46:59 CEST 2015
-    Fri Nov  6 15:22:24 CET 2015
-    Thu Nov 19 14:55:54 CET 2015
 """
 
 from mpi4py import MPI
@@ -90,6 +80,11 @@ import sys
 import ctypes
 import os
 import warnings
+
+__author__ = "Wolfram Georg Nöhring"
+__copyright__ = "Copyright 2015, EPFL"
+__license__ = "GNU General Public License"
+__email__ = "wolfram.nohring@epfl.ch"
 
 def main():
     # Parse configuration file
@@ -170,13 +165,7 @@ def main():
     right_dof = np.empty(num_dof)
 
     # Create Lammps instances
-    if MPI._sizeof(group) == ctypes.sizeof(ctypes.c_int):
-        MPI_Comm = ctypes.c_int
-    else:
-        MPI_Comm = ctypes.c_void_p
-    comm_ptr = MPI._addressof(group)
-    comm_val = MPI_Comm.from_address(comm_ptr)
-    my_lammps = lammps(name="", cmdargs="", ptr=comm_val)
+    my_lammps = lammps(comm=group)
     if group.rank == 0:
         logfile.write('Generated Lammps instance\n')
 
@@ -734,6 +723,7 @@ def main():
     world.Barrier()
     my_lammps.command('write_data data.out.{:d}'.format(replica))
     my_lammps.close()
+    MPI.Finalize()
 
 def calc_chunk_distance(chunk1, chunk2, comm):
     """Calculate the distance between two vector chunks
