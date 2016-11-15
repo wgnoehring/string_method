@@ -115,12 +115,6 @@ def main():
     string_displacement_threshold = config.getfloat('run', 'string_displacement_threshold')
     measure_time = config.getboolean('run', 'measure_time')
 
-    # Check array masks
-    check_masks = False
-
-    # Check parameterization before Lammps call and after interpolation
-    check_parameterization = False
-
     # Split communicator into groups. Each group will simulate one replica.
     world = MPI.COMM_WORLD
     if world.size < num_replicas - 1:
@@ -323,18 +317,6 @@ def main():
         recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
         root=0
     )
-    if check_masks:
-        chunk_of_masked_dof = ma.copy(chunk_of_my_dof)
-        chunk_of_masked_dof.mask = np.logical_not(chunk_of_dof_mask)
-        chunk_of_masked_dof = chunk_of_masked_dof.compressed()
-        chunk_of_masked_dof = chunk_of_masked_dof.reshape(
-            (chunk_of_masked_dof.size / 3, 3)
-        )
-        np.savetxt(
-            'replica_{:d}_masked_dof_on_cpu_{:d}'.format(replica, group.rank),
-            chunk_of_masked_dof
-        )
-        world.Barrier()
     group.Scatterv(
         sendbuf=[my_image_flags, img_chunk_sizes, img_chunk_displ, MPI.INT],
         recvbuf=[img_chunk, img_chunk_sizes[group.rank], MPI.INT],
@@ -346,8 +328,8 @@ def main():
     chunk_of_my_dof = apply_pbc(
         chunk_of_my_dof, periodic_boundary, image_distances, 'unwrap'
     )
-    # Give every partition on this replica a consistent view on the unwrapped old coordinates
-    # Todo: replace by Allgatherv
+    # Give  every partition  on this  replica a  consistent view  on the
+    # unwrapped old coordinates. Todo: replace by Allgatherv
     group.Gatherv(
         [chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
         [my_dof_old, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
@@ -386,89 +368,6 @@ def main():
         if group.rank == 0:
             msg = 'Iteration {:d} '.format(iteration)
             logfile.write(msg + '-' * max(0, (72-len(msg))) + '\n')
-        if check_parameterization:
-            # Begin of parameterization check [pre] ------------------------------
-            my_lammps.command('run 0')
-            my_dof = np.asarray(my_lammps.gather_atoms("x", 1, 3))
-            my_image_flags = np.asarray(my_lammps.gather_atoms("image", 0, 1))
-            group.Scatterv(
-                sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-                root=0
-            )
-            group.Scatterv(
-                sendbuf=[my_image_flags, img_chunk_sizes, img_chunk_displ, MPI.INT],
-                recvbuf=[img_chunk, img_chunk_sizes[group.rank], MPI.INT],
-                root=0
-            )
-            image_distances = calc_image_distances(
-                img_chunk, periodic_boundary, box_size
-            )
-            chunk_of_my_dof = apply_pbc(
-                chunk_of_my_dof, periodic_boundary, image_distances, 'unwrap'
-            )
-            group.Gatherv(
-                sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-                recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                root=0
-            )
-            group.Scatterv(
-                sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-                root=0
-            )
-            world.Barrier()
-            if (group.rank == 0):
-                world.Sendrecv(
-                    sendbuf=[my_dof, MPI.DOUBLE], dest=right_root,
-                    recvbuf=[left_dof, MPI.DOUBLE], source=left_root
-                )
-            world.Barrier()
-            if  (replica > first_replica):
-                group.Scatterv(
-                    sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                    recvbuf=[chunk_of_left_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-                    root=0
-                )
-            # Compute string length and parameterization
-            if (replica == first_replica):
-                norm_of_total_distance_left = 0.0
-            else:
-                chunk_distance_left, norm_of_total_distance_left = calc_chunk_distance(
-                        chunk_of_my_dof, chunk_of_left_dof, group)
-            norm_of_total_distance_left = np.asarray(norm_of_total_distance_left)
-            parameterization = np.empty(world.size)
-            world.Allgather(
-                    sendbuf=[norm_of_total_distance_left, MPI.DOUBLE],
-                    recvbuf=[parameterization, MPI.DOUBLE]
-            ) # Implicit world.Barrier()
-            world.Barrier()
-            if iteration == 0:
-                mode = 'w'
-            else:
-                mode = 'a'
-            with open('param_view.{:d}'.format(world.rank), mode) as file:
-                file.write(list_to_str(parameterization) + '\n')
-            parameterization = parameterization[group_roots]
-            parameterization = np.cumsum(parameterization, out=parameterization)
-            length = parameterization[-1]
-            parameterization /= length
-            if group.rank == 0:
-                logfile.write(
-                    'String length (parameterization check [pre]):'
-                    + '\t{:.3e}'.format(length) + '\n'
-                )
-                logfile.write(
-                    'Parameterization (parameterization check [pre]):\t'
-                    + list_to_str(parameterization) + '\n'
-                )
-            if has_timer:
-                timer.stamp()
-                logfile.write(
-                    'Time for parameterization check [pre]:\t'
-                    + str(timer.elapsed_time) + '\n'
-                )
-        # End of parameterization check [pre] ------------------------------------
 
         # Evolve replica
         my_lammps.command(minimize_command)
@@ -754,68 +653,6 @@ def main():
                 )
                 requests.append(my_request)
             re = MPI.Request.Waitall(requests)
-
-
-        if check_parameterization:
-            ## Begin of parameterization check [post] ---------------------------------
-            group.Scatterv(
-                sendbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                recvbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-                root=0
-            )
-            # Todo: remove Gatherv (unnecessary)
-            group.Gatherv(
-                sendbuf=[chunk_of_my_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-                recvbuf=[my_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                root=0
-            )
-            world.Barrier()
-            if (group.rank == 0):
-                world.Sendrecv(
-                    sendbuf=[my_dof, MPI.DOUBLE], dest=right_root,
-                    recvbuf=[left_dof, MPI.DOUBLE], source=left_root
-                )
-            world.Barrier()
-            if  (replica > first_replica):
-                group.Scatterv(
-                    sendbuf=[left_dof, dof_chunk_sizes, dof_chunk_displ, MPI.DOUBLE],
-                    recvbuf=[chunk_of_left_dof, dof_chunk_sizes[group.rank], MPI.DOUBLE],
-                    root=0
-                )
-            # Compute string length and parameterization
-            if (replica == first_replica):
-                norm_of_total_distance_left = 0.0
-            else:
-                chunk_distance_left, norm_of_total_distance_left = calc_chunk_distance(
-                        chunk_of_my_dof, chunk_of_left_dof, group)
-            norm_of_total_distance_left = np.asarray(norm_of_total_distance_left)
-            check_parameterization = np.empty(world.size)
-            world.Allgather(
-                    sendbuf=[norm_of_total_distance_left, MPI.DOUBLE],
-                    recvbuf=[check_parameterization, MPI.DOUBLE]
-            ) # Implicit world.Barrier()
-            world.Barrier()
-            check_parameterization = check_parameterization[group_roots]
-            check_parameterization = np.cumsum(
-                    check_parameterization, out=check_parameterization
-            )
-            check_length = check_parameterization[-1]
-            check_parameterization /= check_length
-            if group.rank == 0:
-                logfile.write(
-                    'String length (parameterization check [post]):'
-                    + '\t{:.3e}'.format(check_length) + '\n'
-                )
-                logfile.write(
-                    'Parameterization (parameterization check [post]):\t'
-                    + list_to_str(check_parameterization) + '\n'
-                )
-            if has_timer:
-                timer.stamp()
-                logfile.write(
-                    'Time since last timer call:\t' + str(timer.elapsed_time) + '\n'
-                )
-            # End of parameterization check [post] -----------------------------------
 
         # Reset coordinates  of atoms with  fixed dofs. This is  necessary even
         # though masked chunks have been used throughout because Gatherv copies
@@ -1108,23 +945,10 @@ def safe_template_string(multiline_string):
             safe_template_string += line + "\n"
     return CustomTemplate(safe_template_string)
 
-def check_mask(masked_array):
-    """Check if an array is really masked.
-
-    This is a helper function for debugging.
-
-    Parameters
-    ----------
-    masked_array (numpy.ma.array): supposedly masked array
-    """
-    assert(isinstance(masked_array, ma.core.MaskedArray))
-    return True
-
 class CustomTemplate(Template):
         delimiter = "?"
 
 class Timer():
-
     """Timer for MPI"""
 
     def __init__(self):
