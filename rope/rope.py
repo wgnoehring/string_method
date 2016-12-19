@@ -1,4 +1,5 @@
 #!/bin/env python
+# -*- coding: utf-8 -*-
 """Calculate a transition path with the modified string method.
 
 This is a prototype implementation of the modified string method, see Weinan et
@@ -107,6 +108,7 @@ def main():
         raise ValueError('Wrong periodic boundary information')
     num_lammps_iterations = config.getint('run', 'num_lammps_iterations')
     max_string_iterations = config.getint('run', 'max_string_iterations')
+    time_limit = config.getfloat('run', 'time_limit')
     string_displacement_threshold = config.getfloat(
         'run', 'string_displacement_threshold'
     )
@@ -359,12 +361,9 @@ def main():
 
     for iteration in range(max_string_iterations):
         if world.rank == 0:
-            user_requested_stop = os.path.exists('STOP_NOW')
-            user_requested_stop = np.array((user_requested_stop, ), dtype=int)
-        else:
-            user_requested_stop = np.empty((1, ), dtype=int)
-        world.Bcast([user_requested_stop, 1, MPI.INT_INT], root=0)
-        user_requested_stop = user_requested_stop[0]
+            if os.path.exists('STOP_NOW'):
+                user_requested_stop = True
+        user_requested_stop = world.bcast(user_requested_stop, root=0)
 
         if group.rank == 0:
             msg = 'Iteration {:d} '.format(iteration)
@@ -767,6 +766,9 @@ def main():
                 'Time since last timer call:\t' +
                 str(timer.elapsed_time) + '\n'
             )
+            if timer.total_elapsed_time > time_limit:
+                user_requested_stop = True
+        user_requested_stop = world.bcast(user_requested_stop, root=0)
         if group.rank == 0:
             logfile.flush()
         if converged or user_requested_stop:
@@ -954,7 +956,7 @@ def save_reaction_path(
         line = vector_to_str(parameterization)
         file.write(line)
     with open('energies.txt', 'a') as file:
-        line = vector_to_str(energies)
+        line = vector_to_str(energies, float_format="{:.8f}")
         file.write(line)
     with open('displacements.txt', 'a') as file:
         line = vector_to_str(displacements)
@@ -1008,9 +1010,11 @@ class Timer():
     def __init__(self):
         self.wtime = MPI.Wtime()
         self.elapsed_time = 0.0
+        self.total_elapsed_time = 0.0
     def stamp(self):
         current_time = MPI.Wtime()
         self.elapsed_time = current_time - self.wtime
+        self.total_elapsed_time += self.elapsed_time
         self.wtime = current_time
 
 
