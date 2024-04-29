@@ -1,0 +1,90 @@
+# String Method for Lammps
+
+This is a Lammps [1] based implementation of the modified String method [2] for
+transition path calculations. 
+
+## Usage 
+
+See the header of src/string_method/string_method.py
+There are three types of input files:
+
+* A configuration file `string.cfg` with parameters for the calculation
+* A Lammps input file that sets up the calculation in Lammps
+* A set of input images that form the first approximation of the transition path
+
+E.g. consider the case where we want to calculate the transition path of 
+a reaction using 16 images. Let's assume our initial estimates (e.g. 
+linear interpolation of coordinates between initial and final state) 
+are stored in `REPLICAS/data.*`, i.e. `REPLICA/data.0`, `REPLICA/data.1` ..
+`REPLICA/data.15`, with data.0 and data.15 being the initial and final
+state, respectively.  
+
+The configuration file might look as follows:
+
+```
+[setup]
+# Lammps setup file
+setup_file = in.lammps.string
+# Number of replicas
+num_replicas = 16                 
+# Number of atoms
+num_atoms = 311040                
+# Atom types with fixed degrees of freedom
+fixed_types = 3 4                 
+# X, Y, Z periodicity
+# Note: in case of parallelepiped-shaped
+# simulations, only the orthogonal face 
+# can be periodic at the moment.
+periodic_boundary = 0 0 1         
+[run]
+# Number of Lammps iterations between reparameterizations
+num_lammps_iterations = 100
+# Maximum number of reparameterizations
+max_string_iterations = 400
+# Stop criterion 
+string_displacement_threshold = 1.0e-3
+# Measure run time 
+measure_time = True                     
+```
+
+And the Lammps input file might look as follows:
+
+```
+#------ Create the box, the lattice, and the atoms -------#
+log log.?c
+units      metal
+boundary   s s p
+atom_style atomic
+atom_modify map array
+atom_modify sort 0 0.0
+
+read_data ./REPLICAS/data.?c
+
+pair_style eam/alloy
+pair_coeff * * "MgAl-LEA.eam.alloy" Al Mg Al Mg
+
+#------ Fix the shell ------------------------------------#
+group nebatoms type 1 2
+group shell type 3 4 
+fix freeze shell setforce 0 0 0 
+
+#------ Prepare minimization -----------------------------#
+# The following neighborlist parameters are required during minimization.
+# If they are not given, lammps will use them anyway and issue a warning.
+neigh_modify delay 0 every 1 check yes
+timestep 0.001
+min_style fire
+thermo 100
+variable PE equal pe
+compute  PE_atom all pe/atom
+```
+
+## Requirements
+
+The code should be compatible with Lammps versions 2016-2018 and Python
+versions 3.5 to 3.6 (and likely more recent). More recent versions of Lammps
+may be incompatible if the Python interface has changed. The code uses mpi4py
+for parallelization.
+
+[1] https://github.com/lammps/lammps
+[2] Weinan et al. The Journal of Chemical Physics 126, 164103 2007
