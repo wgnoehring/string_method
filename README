@@ -19,6 +19,11 @@ are stored in `REPLICAS/data.*`, i.e. `REPLICA/data.0`, `REPLICA/data.1` ..
 `REPLICA/data.15`, with data.0 and data.15 being the initial and final
 state, respectively.  
 
+The input files are described below. The calculation is started as follows:
+```
+mpirun -np <num_processors> string_method.py <config_file>
+```
+
 The configuration file might look as follows:
 
 ```
