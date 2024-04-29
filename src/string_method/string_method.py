@@ -25,7 +25,7 @@ The string  iteration can  be prematurely  stopped by  placing an  (empty) file
 'STOP_NOW' in  the current directory.
 
 Example:
-    srun rope.py config_file
+    mpirun -np <num_processors> rope.py <config_file>
 
 Args:
     config_file: Parameters for the  string method calculation, stored in  the
